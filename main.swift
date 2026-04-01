@@ -11,12 +11,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     var isCollapsed = false
     private let hasLaunchedBeforeKey = "MenuTidy_HasLaunchedBefore"
-    private var aboutPopover: NSPopover?
-    private var aboutMonitor: Any?
+    let updateChecker = JorvikUpdateChecker(repoName: "MenuTidy")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupStatusItems()
         setupCmdKeyMonitor()
+        updateChecker.checkOnSchedule()
 
         let hasLaunchedBefore = UserDefaults.standard.bool(forKey: hasLaunchedBeforeKey)
         if hasLaunchedBefore {
@@ -25,6 +25,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         } else {
             UserDefaults.standard.set(true, forKey: hasLaunchedBeforeKey)
+        }
+
+        // Refresh pill on appearance change
+        DistributedNotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appearanceChanged),
+            name: NSNotification.Name("AppleInterfaceThemeChangedNotification"),
+            object: nil
+        )
+    }
+
+    @objc func appearanceChanged() {
+        if let button = chevronItem.button {
+            JorvikMenuBarPill.refresh(on: button)
         }
     }
 
@@ -53,6 +67,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             button.action = #selector(statusItemClicked(_:))
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
             updateIcon()
+            JorvikMenuBarPill.apply(to: button)
         }
 
         // Create spacer second (to the left, among third-party items)
@@ -153,7 +168,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
             let frame = window.frame
-            let screenRight = NSScreen.main?.frame.maxX ?? 2560
             // Chevron is off-screen if it's been pushed past the left edge
             // or squeezed to nothing
             if frame.width < 5 || frame.maxX < 50 || frame.minX < 0 {
@@ -180,77 +194,49 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func openAbout() {
-        guard let button = chevronItem.button else { return }
-        let p = NSPopover()
-        p.behavior = .applicationDefined
-        p.animates = true
-        let hc = NSHostingController(rootView: AboutView(appName: "MenuTidy", onDismiss: { [weak self] in self?.closeAbout() }))
-        hc.view.wantsLayer = true
-        hc.view.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
-        p.contentViewController = hc
-        p.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-        aboutPopover = p
-        aboutMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
-            self?.closeAbout()
+        JorvikAboutView.showWindow(
+            appName: "MenuTidy",
+            repoName: "MenuTidy",
+            productPage: "utilities/menutidy"
+        )
+    }
+
+    @objc func openSettings() {
+        JorvikSettingsView.showWindow(
+            appName: "MenuTidy",
+            updateChecker: updateChecker
+        ) { [weak self] in
+            MenuBarPillSettings {
+                if let button = self?.chevronItem.button {
+                    JorvikMenuBarPill.apply(to: button)
+                }
+            }
         }
     }
 
-    func closeAbout() {
-        aboutPopover?.performClose(nil)
-        aboutPopover = nil
-        if let m = aboutMonitor { NSEvent.removeMonitor(m); aboutMonitor = nil }
-    }
-
     func buildMenu() -> NSMenu {
-        let menu = NSMenu()
-
-        let aboutItem = NSMenuItem(title: "About MenuTidy", action: #selector(openAbout), keyEquivalent: "")
-        aboutItem.target = self
-        menu.addItem(aboutItem)
-        menu.addItem(NSMenuItem.separator())
-
-        let tip = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-        tip.isEnabled = false
-        tip.attributedTitle = NSAttributedString(
-            string: "⌘+drag icons to the right of the\nspacer to keep them always visible",
+        let tipText = NSAttributedString(
+            string: "\u{2318}+drag icons to the right of the\nspacer to keep them always visible",
             attributes: [
                 .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
                 .foregroundColor: NSColor.secondaryLabelColor,
             ]
         )
-        menu.addItem(tip)
-
-        menu.addItem(NSMenuItem.separator())
-
-        let loginItem = NSMenuItem(
-            title: "Start at Login",
-            action: #selector(toggleLoginItem(_:)),
-            keyEquivalent: ""
+        let tip = JorvikMenuBuilder.ActionItem(
+            title: "",
+            action: #selector(NSObject.description),
+            target: self,
+            isEnabled: false,
+            attributedTitle: tipText
         )
-        loginItem.target = self
-        loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
-        menu.addItem(loginItem)
 
-        menu.addItem(NSMenuItem.separator())
-
-        menu.addItem(NSMenuItem(
-            title: "Quit MenuTidy",
-            action: #selector(NSApplication.terminate(_:)),
-            keyEquivalent: "q"
-        ))
-
-        return menu
-    }
-
-    @objc func toggleLoginItem(_ sender: NSMenuItem) {
-        let service = SMAppService.mainApp
-        do {
-            if service.status == .enabled {
-                try service.unregister()
-            } else {
-                try service.register()
-            }
-        } catch {}
+        return JorvikMenuBuilder.buildMenu(
+            appName: "MenuTidy",
+            aboutAction: #selector(openAbout),
+            settingsAction: #selector(openSettings),
+            target: self,
+            actions: [tip]
+        )
     }
 }
 
