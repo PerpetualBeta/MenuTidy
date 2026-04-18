@@ -4,12 +4,16 @@ A lightweight macOS menu bar manager that keeps your menu bar clean by collapsin
 
 ## Requirements
 
-- macOS 13 (Ventura) or later
+- macOS 14 (Sonoma) or later
 
 ## Installation
 
-1. Double-click `MenuTidy.app` to launch it
-2. You'll see a chevron icon (`»`) appear in your menu bar — this is MenuTidy
+Two formats on every release — both signed and notarised, pick whichever suits:
+
+- **[Installer (`.pkg`)](https://github.com/PerpetualBeta/MenuTidy/releases/latest/download/MenuTidy.pkg)** — recommended for first-time installs. Double-click to run; macOS Installer places the app in `/Applications` without quarantine or App Translocation.
+- **[Download (`.zip`)](https://github.com/PerpetualBeta/MenuTidy/releases/latest)** — unzip and drag `MenuTidy.app` to your Applications folder.
+
+After installation, launch MenuTidy — a chevron icon (`»`) appears in your menu bar.
 
 ## How It Works
 
