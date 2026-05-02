@@ -14,6 +14,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let updateChecker = JorvikUpdateChecker(repoName: "MenuTidy")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        UserDefaults.standard.register(defaults: ["menuBarPillEnabled": true])
+        migrateLegacyPillColorKey()
+
         setupStatusItems()
         setupCmdKeyMonitor()
         updateChecker.checkOnSchedule()
@@ -26,20 +29,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             UserDefaults.standard.set(true, forKey: hasLaunchedBeforeKey)
         }
-
-        // Refresh pill on appearance change
-        DistributedNotificationCenter.default.addObserver(
-            self,
-            selector: #selector(appearanceChanged),
-            name: NSNotification.Name("AppleInterfaceThemeChangedNotification"),
-            object: nil
-        )
     }
 
-    @objc func appearanceChanged() {
-        if let button = chevronItem.button {
-            JorvikMenuBarPill.refresh(on: button)
-        }
+    // One-shot removal of the user-chosen pill colour key from the old design.
+    // The new pill uses fixed grey/light colours; the key is dead weight.
+    private func migrateLegacyPillColorKey() {
+        let migrated = "didMigratePillColorV2"
+        if UserDefaults.standard.bool(forKey: migrated) { return }
+        UserDefaults.standard.removeObject(forKey: "menuBarPillColor")
+        UserDefaults.standard.set(true, forKey: migrated)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -67,7 +65,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             button.action = #selector(statusItemClicked(_:))
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
             updateIcon()
-            JorvikMenuBarPill.apply(to: button)
         }
 
         // Create spacer second (to the left, among third-party items)
@@ -135,7 +132,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func updateIcon() {
         guard let button = chevronItem.button else { return }
         let symbolName = isCollapsed ? "chevron.left.2" : "chevron.right.2"
-        button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "MenuTidy")
+        button.image = JorvikMenuBarPill.icon(
+            symbolName: symbolName,
+            accessibilityDescription: "MenuTidy"
+        )
     }
 
     // MARK: Click Handling
@@ -206,11 +206,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             appName: "MenuTidy",
             updateChecker: updateChecker
         ) { [weak self] in
-            MenuBarPillSettings {
-                if let button = self?.chevronItem.button {
-                    JorvikMenuBarPill.apply(to: button)
-                }
-            }
+            MenuBarPillSettings { self?.updateIcon() }
         }
     }
 
