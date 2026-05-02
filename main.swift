@@ -14,7 +14,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let updateChecker = JorvikUpdateChecker(repoName: "MenuTidy")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        UserDefaults.standard.register(defaults: ["menuBarPillEnabled": true])
         migrateLegacyPillColorKey()
 
         setupStatusItems()
