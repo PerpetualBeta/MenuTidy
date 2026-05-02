@@ -55,12 +55,19 @@ You can also move the spacer itself. Hold **⌘** and drag the glowing blue bar 
 | Hold ⌘ | Reveal the spacer position (blue bar) |
 | ⌘+drag an icon | Move it between hidden/visible zones |
 
-## Settings Menu
+## Right-click Menu
 
-Right-click the chevron to access:
+Right-click the chevron for the standard Jorvik menu:
 
-- **Start at Login** — launch MenuTidy automatically when you log in
-- **Quit MenuTidy** — exit the app (all hidden icons will reappear)
+- **About MenuTidy**
+- **Settings…**
+- **Quit MenuTidy** — exit the app (all hidden icons reappear)
+
+### Settings…
+
+- **Menu bar icon pill** — optional grey background for stronger contrast on busy or wallpaper-tinted menu bars (off by default)
+- **Launch at Login** — start MenuTidy automatically when you log in
+- **Auto-update** — check for new versions on a configurable schedule with optional automatic installation
 
 ## Behaviour on Restart
 
