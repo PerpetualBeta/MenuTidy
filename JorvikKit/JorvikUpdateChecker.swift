@@ -188,56 +188,74 @@ final class JorvikUpdateChecker {
                 return
             }
 
-            // Replace the running app using a post-quit shell script.
-            // FileManager can't move SIP-protected signed bundles while
-            // running; we have to detach a script that waits for us to quit
-            // and then does the move.
+            // Two-stage update:
             //
-            // Privilege handling: when the app was installed via .pkg, the
-            // bundle is owned by root:wheel and the user can't rm-rf it.
-            // Detect ownership; if root-owned, run the same script as root
-            // via NSAppleScript's "with administrator privileges" — the user
-            // sees one Touch ID / password prompt per update. If user-owned
-            // (zip-installed, dragged in), no elevation needed.
+            // 1. Replace script — does rm/mv/chown synchronously (sync because
+            //    we need to know it succeeded before we quit). Runs admin via
+            //    AppleScript when the bundle is root-owned (.pkg install),
+            //    plain bash otherwise. It does NOT wait for us to quit; it
+            //    just replaces the bundle in-place. macOS keeps our mmap'd
+            //    binary alive by inode, so we keep functioning long enough
+            //    to spawn the relauncher.
+            //
+            // 2. Relaunch script — user-owned (NEVER admin), detaches via
+            //    nohup/&, watches for our process to disappear, then opens
+            //    the new bundle. The detachment works because user-spawned
+            //    processes aren't subject to the AppleScript admin session
+            //    cleanup that was killing the previous one-stage script.
+            //
+            // Logging goes to /tmp/jorvik_update.log so we can diagnose any
+            // future failures end-to-end without having to repro live.
             let currentAppURL = Bundle.main.bundleURL
             let currentPath = currentAppURL.path
             let newAppPath = appBundle.path
-            let pid = ProcessInfo.processInfo.processIdentifier
-            let uid = getuid()
             let needsElevation = bundleNeedsElevatedReplace()
 
-            let script = """
+            let logPath = "/tmp/jorvik_update.log"
+            let replacePath = "/tmp/jorvik_replace.sh"
+            let relaunchPath = "/tmp/jorvik_relaunch.sh"
+
+            let replaceScript = """
             #!/bin/bash
-            # Wait for the app to quit
-            while kill -0 \(pid) 2>/dev/null; do sleep 0.2; done
-            # Remove old app
+            set -e
+            exec >>\(logPath) 2>&1
+            echo "[$(date '+%H:%M:%S')] replace: start (uid=$(id -u), running as $(whoami))"
+            echo "[$(date '+%H:%M:%S')] replace: rm '\(currentPath)'"
             rm -rf '\(currentPath)'
-            # Move new app into place
+            echo "[$(date '+%H:%M:%S')] replace: mv '\(newAppPath)' → '\(currentPath)'"
             mv '\(newAppPath)' '\(currentPath)'
-            \(needsElevation ? "# Restore root ownership to match the original .pkg install\nchown -R root:wheel '\(currentPath)'" : "")
-            # Clean up the extracted dir
+            \(needsElevation ? "echo \"[$(date '+%H:%M:%S')] replace: chown root:wheel\"\nchown -R root:wheel '\(currentPath)'" : "")
             rm -rf '\(extractDir.path)'
-            # Relaunch as the user (works whether we're running as root or user)
-            launchctl asuser \(uid) /usr/bin/open '\(currentPath)'
-            # Self-destruct
-            rm -f /tmp/jorvik_update.sh
+            echo "[$(date '+%H:%M:%S')] replace: done"
             """
 
-            let scriptPath = "/tmp/jorvik_update.sh"
-            try script.write(toFile: scriptPath, atomically: true, encoding: .utf8)
+            let relaunchScript = """
+            #!/bin/bash
+            exec >>\(logPath) 2>&1
+            echo "[$(date '+%H:%M:%S')] relaunch: waiting for old MenuTidy to quit"
+            while pgrep -f '\(currentPath)/Contents/MacOS/' >/dev/null; do
+                sleep 0.3
+            done
+            echo "[$(date '+%H:%M:%S')] relaunch: opening new instance"
+            /usr/bin/open '\(currentPath)'
+            rm -f \(replacePath) \(relaunchPath)
+            echo "[$(date '+%H:%M:%S')] relaunch: done"
+            """
 
-            let chmod = Process()
-            chmod.executableURL = URL(fileURLWithPath: "/bin/chmod")
-            chmod.arguments = ["+x", scriptPath]
-            try chmod.run()
-            chmod.waitUntilExit()
+            try replaceScript.write(toFile: replacePath, atomically: true, encoding: .utf8)
+            try relaunchScript.write(toFile: relaunchPath, atomically: true, encoding: .utf8)
 
+            for path in [replacePath, relaunchPath] {
+                let chmod = Process()
+                chmod.executableURL = URL(fileURLWithPath: "/bin/chmod")
+                chmod.arguments = ["+x", path]
+                try chmod.run()
+                chmod.waitUntilExit()
+            }
+
+            // Stage 1: replace bundle (sync, possibly admin-elevated)
             if needsElevation {
-                // do shell script blocks; launch the bash script detached
-                // so AppleScript returns immediately (otherwise it would
-                // wait forever, and the bash script is itself waiting for
-                // us to quit).
-                let appleScriptSource = #"do shell script "nohup /bin/bash \#(scriptPath) </dev/null >/dev/null 2>&1 &" with administrator privileges"#
+                let appleScriptSource = #"do shell script "/bin/bash \#(replacePath)" with administrator privileges"#
                 guard let osa = NSAppleScript(source: appleScriptSource) else {
                     status = .error("Could not compile updater")
                     return
@@ -252,13 +270,25 @@ final class JorvikUpdateChecker {
                     return
                 }
             } else {
-                let launcher = Process()
-                launcher.executableURL = URL(fileURLWithPath: "/bin/bash")
-                launcher.arguments = [scriptPath]
-                try launcher.run()
+                let proc = Process()
+                proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+                proc.arguments = [replacePath]
+                try proc.run()
+                proc.waitUntilExit()
+                if proc.terminationStatus != 0 {
+                    status = .error("Replacement failed (exit code \(proc.terminationStatus))")
+                    return
+                }
             }
 
-            // Quit so the script can replace us
+            // Stage 2: spawn user-owned relauncher (detaches reliably)
+            let relauncher = Process()
+            relauncher.executableURL = URL(fileURLWithPath: "/bin/bash")
+            relauncher.arguments = ["-c", "nohup /bin/bash \(relaunchPath) </dev/null >/dev/null 2>&1 &"]
+            try relauncher.run()
+            relauncher.waitUntilExit()
+
+            // Quit; the relauncher is now waiting for our PID to disappear
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                 NSApp.terminate(nil)
             }
