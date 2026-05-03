@@ -237,10 +237,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             _ = AXIsProcessTrustedWithOptions(opts)
         }
 
-        // Use the cache for instant open. Schedule a background refresh in
-        // the background so the next open sees any drift since the last
-        // app-launch / app-terminate event fired.
-        let items = HiddenIcons.cached
+        // Prefer the cache for instant open. But if the cache is empty,
+        // detect synchronously — covers the case where the cache was first
+        // populated before AX was granted (stale-empty), or where macOS has
+        // just placed an app behind the notch since the last NSWorkspace
+        // event fired. Cheap when there's genuinely nothing clipped.
+        var items = HiddenIcons.cached
+        if items.isEmpty && axGranted {
+            items = HiddenIcons.detectClipped()
+        }
         HiddenIcons.refreshAsync()
 
         let panel = HiddenIconsPanel(items: items, axGranted: axGranted)
@@ -311,6 +316,8 @@ enum HiddenIcons {
     private static let cacheQueue = DispatchQueue(label: "cc.jorviksoftware.MenuTidy.hidden-icons.cache")
     private static var _cached: [HiddenIcon] = []
     private static var cachingStarted = false
+    private static var lastAXTrusted = false
+    private static var axPollTimer: Timer?
 
     static var cached: [HiddenIcon] {
         cacheQueue.sync { _cached }
@@ -321,6 +328,7 @@ enum HiddenIcons {
         guard !cachingStarted else { return }
         cachingStarted = true
 
+        lastAXTrusted = AXIsProcessTrusted()
         refreshAsync()
 
         let center = NSWorkspace.shared.notificationCenter
@@ -338,6 +346,19 @@ enum HiddenIcons {
             queue: .main
         ) { _ in
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { refreshAsync() }
+        }
+
+        // macOS doesn't fire a notification when AX permission changes, so
+        // poll. Cheap (one syscall every few seconds), and only matters until
+        // the user grants AX once — after that the polled value never flips
+        // back unless they revoke. On any flip false→true we kick a fresh
+        // detect so the panel sees real data on its next open.
+        axPollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
+            let now = AXIsProcessTrusted()
+            if now != lastAXTrusted {
+                lastAXTrusted = now
+                if now { refreshAsync() }
+            }
         }
     }
 
@@ -366,8 +387,6 @@ enum HiddenIcons {
     /// Walks every running app's `AXExtrasMenuBar` and returns only the status
     /// items whose logical X centre falls inside the notch's horizontal range
     /// — i.e. the ones the menu bar can't render because the notch is there.
-    /// Items with a zero-size frame are also treated as clipped (macOS reports
-    /// some not-rendered items that way too).
     static func detectClipped() -> [HiddenIcon] {
         guard let notchRange = notchHorizontalRange() else { return [] }
         var result: [HiddenIcon] = []
