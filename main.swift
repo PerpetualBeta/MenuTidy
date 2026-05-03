@@ -237,11 +237,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             _ = AXIsProcessTrustedWithOptions(opts)
         }
 
-        // Prefer the cache for instant open. But if the cache is empty,
-        // detect synchronously — covers the case where the cache was first
-        // populated before AX was granted (stale-empty), or where macOS has
-        // just placed an app behind the notch since the last NSWorkspace
-        // event fired. Cheap when there's genuinely nothing clipped.
+        // Show the cached snapshot for an instant open, but kick off a fresh
+        // detect immediately and update the panel's content in place when it
+        // completes. Covers the case where the cache was populated during
+        // initial menu bar reflow (and so missed icons that drifted into the
+        // notch a moment later) without making the user wait.
         var items = HiddenIcons.cached
         HiddenIcons.log("revealHiddenIcons: AX granted=\(axGranted), cache count=\(items.count)")
         if items.isEmpty && axGranted {
@@ -249,13 +249,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             items = HiddenIcons.detectClipped()
             HiddenIcons.log("revealHiddenIcons: synchronous detect returned \(items.count) item(s)")
         }
-        HiddenIcons.refreshAsync()
 
         let panel = HiddenIconsPanel(items: items, axGranted: axGranted)
         panel.anchor(to: chevronItem)
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         revealPanel = panel
+
+        // Live-update the panel with the post-refresh list. If items differ
+        // (count or membership), rebuild — common when the menu bar has
+        // shifted between cache time and panel open.
+        HiddenIcons.refreshAsync { [weak panel] fresh in
+            guard let panel, panel.isVisible else { return }
+            HiddenIcons.log("revealHiddenIcons: live update — fresh count=\(fresh.count) (was \(items.count))")
+            panel.updateItems(fresh)
+        }
     }
 
     func buildMenu() -> NSMenu {
@@ -389,10 +397,15 @@ enum HiddenIcons {
     }
 
     /// Schedules a background re-detect and updates the cache when done.
-    static func refreshAsync() {
+    /// Optional completion fires on the main queue with the fresh list,
+    /// so an open reveal panel can update its visible content in place.
+    static func refreshAsync(completion: (([HiddenIcon]) -> Void)? = nil) {
         DispatchQueue.global(qos: .utility).async {
             let items = detectClipped()
             cacheQueue.sync { _cached = items }
+            if let completion {
+                DispatchQueue.main.async { completion(items) }
+            }
         }
     }
 
@@ -509,7 +522,7 @@ enum HiddenIcons {
 /// item so the user can use icons that are clipped behind the notch.
 final class HiddenIconsPanel: NSPanel {
 
-    private let items: [HiddenIcon]
+    private var items: [HiddenIcon]
     private let axGranted: Bool
 
     init(items: [HiddenIcon], axGranted: Bool) {
@@ -543,6 +556,32 @@ final class HiddenIconsPanel: NSPanel {
         let originX = buttonFrame.midX - frame.width / 2
         let originY = buttonFrame.minY - frame.height - 4
         setFrameOrigin(NSPoint(x: originX, y: originY))
+    }
+
+    /// Replace the panel's content with a fresh list. Called by the
+    /// live-update path after a background refresh discovers items that
+    /// the cache snapshot at open time didn't have.
+    func updateItems(_ newItems: [HiddenIcon]) {
+        // No-op if identical — avoids needless rebuild flicker.
+        let oldKeys = items.map { "\($0.appName)|\(Int($0.frame.minX))" }
+        let newKeys = newItems.map { "\($0.appName)|\(Int($0.frame.minX))" }
+        guard oldKeys != newKeys else { return }
+        items = newItems
+
+        // Resize to fit and rebuild content. setFrame with display:true
+        // resizes contentView synchronously so buildContent's NSVisualEffectView
+        // gets the right bounds.
+        let rowH: CGFloat = 32
+        let pad: CGFloat = 8
+        let headerH: CGFloat = items.isEmpty ? 0 : 22
+        let footerH: CGFloat = 22
+        let height = pad * 2 + headerH + CGFloat(items.count) * rowH + footerH
+        var f = frame
+        let oldHeight = f.height
+        f.size.height = max(height, 80)
+        f.origin.y += oldHeight - f.size.height  // keep top edge anchored
+        setFrame(f, display: true)
+        buildContent(rowHeight: rowH, padding: pad, headerHeight: headerH, footerHeight: footerH)
     }
 
     override var canBecomeKey: Bool { true }
