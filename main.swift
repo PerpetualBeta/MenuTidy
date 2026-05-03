@@ -351,6 +351,22 @@ enum HiddenIcons {
     private static var lastAXTrusted = false
     private static var axPollTimer: Timer?
 
+    // Cache of PIDs known to host status items (AXExtrasMenuBar non-nil).
+    // Built by detectClippedFull(); read by detectClipped() to skip the
+    // ~70% of running apps that have no menu bar items at all.
+    private static let pidQueue = DispatchQueue(label: "cc.jorviksoftware.MenuTidy.hidden-icons.pids")
+    private static var _hostPIDs: Set<pid_t> = []
+
+    private static var hostPIDs: Set<pid_t> {
+        pidQueue.sync { _hostPIDs }
+    }
+    private static func setHostPIDs(_ newValue: Set<pid_t>) {
+        pidQueue.sync { _hostPIDs = newValue }
+    }
+    private static func removeHostPID(_ pid: pid_t) {
+        pidQueue.sync { _ = _hostPIDs.remove(pid) }
+    }
+
     static var cached: [HiddenIcon] {
         cacheQueue.sync { _cached }
     }
@@ -362,43 +378,48 @@ enum HiddenIcons {
 
         lastAXTrusted = AXIsProcessTrusted()
         log("startCaching: initial AX trusted = \(lastAXTrusted)")
-        refreshAsync()
+        refreshAsyncFull()
 
         let center = NSWorkspace.shared.notificationCenter
         center.addObserver(
             forName: NSWorkspace.didLaunchApplicationNotification,
             object: nil,
             queue: .main
-        ) { _ in
-            // Small delay so the launching app has time to create its status item.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { refreshAsync() }
+        ) { note in
+            // The new app might be a status-item host. Small delay so it has
+            // time to create its NSStatusItem; full walk picks it up.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { refreshAsyncFull() }
         }
         center.addObserver(
             forName: NSWorkspace.didTerminateApplicationNotification,
             object: nil,
             queue: .main
-        ) { _ in
+        ) { note in
+            // Trim the terminated PID from the host cache immediately so
+            // subsequent fast walks don't waste an AX query on a dead pid.
+            if let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
+                removeHostPID(app.processIdentifier)
+            }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { refreshAsync() }
         }
 
         // macOS doesn't fire a notification when AX permission changes, so
         // poll. Cheap (one syscall every few seconds), and only matters until
         // the user grants AX once — after that the polled value never flips
-        // back unless they revoke. On any flip false→true we kick a fresh
-        // detect so the panel sees real data on its next open.
+        // back unless they revoke. On any flip false→true we kick a full
+        // refresh because the previous "empty cache" came from no AX access.
         axPollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
             let now = AXIsProcessTrusted()
             if now != lastAXTrusted {
                 log("AX state flip: \(lastAXTrusted) → \(now)")
                 lastAXTrusted = now
-                if now { refreshAsync() }
+                if now { refreshAsyncFull() }
             }
         }
     }
 
-    /// Schedules a background re-detect and updates the cache when done.
-    /// Optional completion fires on the main queue with the fresh list,
-    /// so an open reveal panel can update its visible content in place.
+    /// Background fast refresh — walks the cached PID set only. Falls back
+    /// to a full walk if the cache is empty (first launch, post-AX-grant).
     static func refreshAsync(completion: (([HiddenIcon]) -> Void)? = nil) {
         DispatchQueue.global(qos: .utility).async {
             let items = detectClipped()
@@ -406,6 +427,17 @@ enum HiddenIcons {
             if let completion {
                 DispatchQueue.main.async { completion(items) }
             }
+        }
+    }
+
+    /// Background full refresh — walks every running app and rebuilds the
+    /// host-PID cache. Used on launch, on AX permission flips, and on app
+    /// launch / terminate notifications so any newly-introduced hoster
+    /// (or removed one) is reflected in subsequent fast refreshes.
+    static func refreshAsyncFull() {
+        DispatchQueue.global(qos: .utility).async {
+            let items = detectClippedFull()
+            cacheQueue.sync { _cached = items }
         }
     }
 
@@ -423,32 +455,49 @@ enum HiddenIcons {
         return lo...hi
     }
 
-    /// Walks every running app's `AXExtrasMenuBar` and returns only the status
-    /// items whose logical X centre falls inside the notch's horizontal range
-    /// — i.e. the ones the menu bar can't render because the notch is there.
-    ///
-    /// AX queries are XPC round-trips into each target process. Sequentially
-    /// that's ~25 ms × ~80 apps = ~2 s. Parallelising via `concurrentPerform`
-    /// drops it by an order of magnitude — the cost per process stays the
-    /// same but they run on multiple cores at once. NSRunningApplication's
-    /// trivial read-only properties (pid, localizedName, bundleIdentifier,
-    /// activationPolicy, icon) are safe to read off the main thread.
+    /// Fast detect — walks only the cached host-PID set. Drops detect time
+    /// from ~1.6 s (full walk over ~80 apps) to ~400 ms (~25 apps with
+    /// status items). Falls back to a full walk if the cache is empty,
+    /// which happens on first run, after an AX permission grant, or if
+    /// the user has somehow ended up with no cached hosters.
     static func detectClipped() -> [HiddenIcon] {
-        let started = Date()
-        let trusted = AXIsProcessTrusted()
-        guard let notchRange = notchHorizontalRange() else {
-            log("detectClipped: no notch range — skipping (AX trusted: \(trusted))")
-            return []
+        let cached = hostPIDs
+        if cached.isEmpty {
+            return detectClippedFull()
         }
-        log("detectClipped: notch X range = \(notchRange.lowerBound)…\(notchRange.upperBound)  AX trusted = \(trusted)")
+        let candidates = cached.compactMap { NSRunningApplication(processIdentifier: $0) }
+        return walk(candidates: candidates, isFullWalk: false)
+    }
 
+    /// Full detect — walks every running app and rebuilds the host-PID
+    /// cache. More expensive (~1.6 s); used at moments where new hosters
+    /// might have appeared (launch, AX flip, app-launch notifications).
+    static func detectClippedFull() -> [HiddenIcon] {
         let candidates = NSWorkspace.shared.runningApplications.filter {
             $0.activationPolicy != .prohibited && $0.processIdentifier > 0
         }
+        return walk(candidates: candidates, isFullWalk: true)
+    }
+
+    /// Shared walk — parallelises AX queries across cores and aggregates
+    /// results under a single NSLock. Logs per-clipped-item after the
+    /// parallel section so log lines stay readable rather than interleaved.
+    /// On a full walk, also rebuilds the host-PID cache from the apps that
+    /// returned a non-nil AXExtrasMenuBar.
+    private static func walk(candidates: [NSRunningApplication], isFullWalk: Bool) -> [HiddenIcon] {
+        let started = Date()
+        let trusted = AXIsProcessTrusted()
+        guard let notchRange = notchHorizontalRange() else {
+            log("detect: no notch range — skipping (AX trusted: \(trusted))")
+            return []
+        }
+
+        let walkType = isFullWalk ? "full" : "fast"
+        log("detect (\(walkType)): notch X range = \(notchRange.lowerBound)…\(notchRange.upperBound)  AX trusted = \(trusted)  candidates = \(candidates.count)")
 
         let lock = NSLock()
         var result: [HiddenIcon] = []
-        var appsWithExtras = 0
+        var hostsFound: Set<pid_t> = []
         var totalItems = 0
 
         DispatchQueue.concurrentPerform(iterations: candidates.count) { idx in
@@ -464,7 +513,7 @@ enum HiddenIcons {
             var childrenRef: CFTypeRef?
             guard AXUIElementCopyAttributeValue(extrasEl, kAXChildrenAttribute as CFString, &childrenRef) == .success,
                   let items = childrenRef as? [AXUIElement] else {
-                lock.lock(); appsWithExtras += 1; lock.unlock()
+                lock.lock(); hostsFound.insert(pid); lock.unlock()
                 return
             }
 
@@ -497,19 +546,25 @@ enum HiddenIcons {
             }
 
             lock.lock()
-            appsWithExtras += 1
+            hostsFound.insert(pid)
             totalItems += items.count
             result.append(contentsOf: localClipped)
             lock.unlock()
         }
 
-        // Log per-clipped-item after the parallel section so log lines stay
-        // sequential and lock contention is zero during AX queries.
+        // After a full walk, the hostsFound set IS the new cache. After a
+        // fast walk, hostsFound is a subset of the cache (apps still hosting
+        // extras); we don't update the cache here — stale PIDs cost ~25 ms
+        // per fast refresh, and they're trimmed on app-terminate notifications.
+        if isFullWalk {
+            setHostPIDs(hostsFound)
+        }
+
         for clipped in result {
-            log("detectClipped:   CLIPPED  \(clipped.appName)  frame=\(clipped.frame)")
+            log("detect:   CLIPPED  \(clipped.appName)  frame=\(clipped.frame)")
         }
         let elapsed = Int(Date().timeIntervalSince(started) * 1000)
-        log("detectClipped: walked \(candidates.count) apps, \(appsWithExtras) had AXExtrasMenuBar, \(totalItems) total items, \(result.count) clipped — \(elapsed)ms")
+        log("detect (\(walkType)): walked \(candidates.count) apps, \(hostsFound.count) had extras, \(totalItems) total items, \(result.count) clipped — \(elapsed)ms")
 
         return result.sorted {
             $0.appName.localizedCaseInsensitiveCompare($1.appName) == .orderedAscending
