@@ -60,19 +60,31 @@ You can also move the spacer itself. Hold **⌘** and drag the glowing blue bar 
 Right-click the chevron for the standard Jorvik menu:
 
 - **About MenuTidy**
+- **Reveal Hidden Icons…** — only shown on Macs with a notch (see below)
 - **Settings…**
 - **Quit MenuTidy** — exit the app (all hidden icons reappear)
 
+## Reveal Hidden Icons (notched Macs)
+
+On 14"/16" MacBook Pros and notched MacBook Airs, the menu bar wraps around the notch — and when you have more status icons than fit in the right-hand segment, the leftmost ones get clipped behind the notch with no way to click them.
+
+MenuTidy's **Reveal Hidden Icons…** menu item drops a panel listing every status icon currently hidden behind the notch. **Left-click** an entry to activate that icon's primary action (or open its menu, if it's a menu-style item); **right-click** to send a right-click instead, for icons that distinguish the two.
+
+The list is cached in the background so the panel opens instantly — it stays in sync as apps launch and quit.
+
+The menu item only appears on notched displays. The first time you use it MenuTidy will ask for Accessibility permission so it can enumerate other apps' status items; you can also grant it ahead of time from **Settings → Permissions**.
+
 ### Settings…
 
+- **Permissions → Accessibility** — required for **Reveal Hidden Icons**; shows live status with a Grant Access button if not yet granted
 - **Menu bar icon pill** — optional grey background for stronger contrast on busy or wallpaper-tinted menu bars (off by default)
 - **Launch at Login** — start MenuTidy automatically when you log in
 - **Auto-update** — check for new versions on a configurable schedule with optional automatic installation
 
 ## Behaviour on Restart
 
-- MenuTidy remembers its position and the spacer position across restarts
-- Other apps' icon positions are also preserved by macOS
+- MenuTidy remembers where you've placed the chevron and the spacer across restarts — your drag-arrangement of either persists
+- Other apps' icon positions are preserved by macOS in their own preferences, so the layout you build once stays put
 - On subsequent launches, MenuTidy automatically collapses after a short delay to let all icons load into their saved positions first
 
 ## Building from Source
@@ -80,7 +92,7 @@ Right-click the chevron for the standard Jorvik menu:
 MenuTidy is a single-file Swift app with no dependencies beyond macOS system frameworks. No Xcode project is required.
 
 ```bash
-cd ~/Desktop/MenuTidy
+cd ~/Desktop/Jorvik\ Software/MenuTidy
 ./build.sh
 open MenuTidy.app
 ```
@@ -96,7 +108,7 @@ If you accidentally move the chevron to the left of the spacer and collapse, Men
 To fully reset MenuTidy's saved positions:
 
 ```bash
-defaults delete com.local.MenuTidy
+defaults delete cc.jorviksoftware.MenuTidy
 ```
 
 Then relaunch the app.
