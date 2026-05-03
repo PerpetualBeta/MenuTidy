@@ -243,11 +243,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // initial menu bar reflow (and so missed icons that drifted into the
         // notch a moment later) without making the user wait.
         var items = HiddenIcons.cached
-        HiddenIcons.log("revealHiddenIcons: AX granted=\(axGranted), cache count=\(items.count)")
         if items.isEmpty && axGranted {
-            HiddenIcons.log("revealHiddenIcons: cache empty + AX granted → synchronous detect")
             items = HiddenIcons.detectClipped()
-            HiddenIcons.log("revealHiddenIcons: synchronous detect returned \(items.count) item(s)")
         }
 
         let panel = HiddenIconsPanel(items: items, axGranted: axGranted)
@@ -261,7 +258,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // shifted between cache time and panel open.
         HiddenIcons.refreshAsync { [weak panel] fresh in
             guard let panel, panel.isVisible else { return }
-            HiddenIcons.log("revealHiddenIcons: live update — fresh count=\(fresh.count) (was \(items.count))")
             panel.updateItems(fresh)
         }
     }
@@ -316,27 +312,6 @@ struct HiddenIcon {
 
 enum HiddenIcons {
 
-    // MARK: Diagnostic logging
-    //
-    // Writes to /tmp/menutidy.log (never Console). Tail with:
-    //     tail -f /tmp/menutidy.log
-
-    private static let logPath = "/tmp/menutidy.log"
-
-    static func log(_ message: String) {
-        let line = "[\(Date())] \(message)\n"
-        guard let data = line.data(using: .utf8) else { return }
-        if FileManager.default.fileExists(atPath: logPath) {
-            if let handle = FileHandle(forWritingAtPath: logPath) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                try? handle.close()
-            }
-        } else {
-            FileManager.default.createFile(atPath: logPath, contents: data, attributes: nil)
-        }
-    }
-
     // MARK: Live cache
     //
     // Enumerating every app's AXExtrasMenuBar takes ~hundreds of ms because
@@ -377,7 +352,6 @@ enum HiddenIcons {
         cachingStarted = true
 
         lastAXTrusted = AXIsProcessTrusted()
-        log("startCaching: initial AX trusted = \(lastAXTrusted)")
         refreshAsyncFull()
 
         let center = NSWorkspace.shared.notificationCenter
@@ -411,7 +385,6 @@ enum HiddenIcons {
         axPollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
             let now = AXIsProcessTrusted()
             if now != lastAXTrusted {
-                log("AX state flip: \(lastAXTrusted) → \(now)")
                 lastAXTrusted = now
                 if now { refreshAsyncFull() }
             }
@@ -480,25 +453,14 @@ enum HiddenIcons {
     }
 
     /// Shared walk — parallelises AX queries across cores and aggregates
-    /// results under a single NSLock. Logs per-clipped-item after the
-    /// parallel section so log lines stay readable rather than interleaved.
-    /// On a full walk, also rebuilds the host-PID cache from the apps that
-    /// returned a non-nil AXExtrasMenuBar.
+    /// results under a single NSLock. On a full walk, also rebuilds the
+    /// host-PID cache from the apps that returned a non-nil AXExtrasMenuBar.
     private static func walk(candidates: [NSRunningApplication], isFullWalk: Bool) -> [HiddenIcon] {
-        let started = Date()
-        let trusted = AXIsProcessTrusted()
-        guard let notchRange = notchHorizontalRange() else {
-            log("detect: no notch range — skipping (AX trusted: \(trusted))")
-            return []
-        }
-
-        let walkType = isFullWalk ? "full" : "fast"
-        log("detect (\(walkType)): notch X range = \(notchRange.lowerBound)…\(notchRange.upperBound)  AX trusted = \(trusted)  candidates = \(candidates.count)")
+        guard let notchRange = notchHorizontalRange() else { return [] }
 
         let lock = NSLock()
         var result: [HiddenIcon] = []
         var hostsFound: Set<pid_t> = []
-        var totalItems = 0
 
         DispatchQueue.concurrentPerform(iterations: candidates.count) { idx in
             let app = candidates[idx]
@@ -547,24 +509,17 @@ enum HiddenIcons {
 
             lock.lock()
             hostsFound.insert(pid)
-            totalItems += items.count
             result.append(contentsOf: localClipped)
             lock.unlock()
         }
 
-        // After a full walk, the hostsFound set IS the new cache. After a
-        // fast walk, hostsFound is a subset of the cache (apps still hosting
-        // extras); we don't update the cache here — stale PIDs cost ~25 ms
-        // per fast refresh, and they're trimmed on app-terminate notifications.
+        // After a full walk, hostsFound IS the new cache. After a fast walk
+        // it's a subset (apps that still host extras); we don't update the
+        // cache here — stale PIDs cost ~25 ms per fast refresh, trimmed on
+        // app-terminate notifications.
         if isFullWalk {
             setHostPIDs(hostsFound)
         }
-
-        for clipped in result {
-            log("detect:   CLIPPED  \(clipped.appName)  frame=\(clipped.frame)")
-        }
-        let elapsed = Int(Date().timeIntervalSince(started) * 1000)
-        log("detect (\(walkType)): walked \(candidates.count) apps, \(hostsFound.count) had extras, \(totalItems) total items, \(result.count) clipped — \(elapsed)ms")
 
         return result.sorted {
             $0.appName.localizedCaseInsensitiveCompare($1.appName) == .orderedAscending
