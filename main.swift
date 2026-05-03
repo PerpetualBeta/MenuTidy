@@ -476,6 +476,13 @@ enum HiddenIcons {
                 // notch range counts as clipped (catches partial-overlap cases
                 // like HyperCaps straddling the notch's right edge).
                 guard frame.width > 0, frame.height > 0 else { continue }
+                // Sanity check: real menu bar status items are 20–60pt wide.
+                // AX occasionally returns bogus aggregate frames (Control Centre
+                // reports a 5016pt-wide rect when MenuTidy's spacer expands to
+                // 10000pt and the menu bar geometry is unusual). Anything
+                // wider than the notch itself can't be a partially-clipped
+                // status item — it's a misreported aggregate.
+                guard frame.width <= 200 else { continue }
                 guard frame.maxX > notchRange.lowerBound, frame.minX < notchRange.upperBound else { continue }
 
                 let title = axString(of: item, attribute: kAXTitleAttribute as CFString)
