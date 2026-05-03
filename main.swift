@@ -426,7 +426,15 @@ enum HiddenIcons {
     /// Walks every running app's `AXExtrasMenuBar` and returns only the status
     /// items whose logical X centre falls inside the notch's horizontal range
     /// — i.e. the ones the menu bar can't render because the notch is there.
+    ///
+    /// AX queries are XPC round-trips into each target process. Sequentially
+    /// that's ~25 ms × ~80 apps = ~2 s. Parallelising via `concurrentPerform`
+    /// drops it by an order of magnitude — the cost per process stays the
+    /// same but they run on multiple cores at once. NSRunningApplication's
+    /// trivial read-only properties (pid, localizedName, bundleIdentifier,
+    /// activationPolicy, icon) are safe to read off the main thread.
     static func detectClipped() -> [HiddenIcon] {
+        let started = Date()
         let trusted = AXIsProcessTrusted()
         guard let notchRange = notchHorizontalRange() else {
             log("detectClipped: no notch range — skipping (AX trusted: \(trusted))")
@@ -434,48 +442,45 @@ enum HiddenIcons {
         }
         log("detectClipped: notch X range = \(notchRange.lowerBound)…\(notchRange.upperBound)  AX trusted = \(trusted)")
 
+        let candidates = NSWorkspace.shared.runningApplications.filter {
+            $0.activationPolicy != .prohibited && $0.processIdentifier > 0
+        }
+
+        let lock = NSLock()
         var result: [HiddenIcon] = []
-        var totalApps = 0
         var appsWithExtras = 0
         var totalItems = 0
 
-        for app in NSWorkspace.shared.runningApplications {
-            guard app.activationPolicy != .prohibited else { continue }
+        DispatchQueue.concurrentPerform(iterations: candidates.count) { idx in
+            let app = candidates[idx]
             let pid = app.processIdentifier
-            guard pid > 0 else { continue }
-            totalApps += 1
-
             let appEl = AXUIElementCreateApplication(pid)
+
             var extrasRef: CFTypeRef?
             guard AXUIElementCopyAttributeValue(appEl, "AXExtrasMenuBar" as CFString, &extrasRef) == .success,
-                  let extras = extrasRef else { continue }
-            appsWithExtras += 1
+                  let extras = extrasRef else { return }
             let extrasEl = extras as! AXUIElement
 
             var childrenRef: CFTypeRef?
             guard AXUIElementCopyAttributeValue(extrasEl, kAXChildrenAttribute as CFString, &childrenRef) == .success,
-                  let items = childrenRef as? [AXUIElement] else { continue }
+                  let items = childrenRef as? [AXUIElement] else {
+                lock.lock(); appsWithExtras += 1; lock.unlock()
+                return
+            }
 
+            var localClipped: [HiddenIcon] = []
             for item in items {
-                totalItems += 1
                 let frame = axFrame(of: item)
-                let appName = app.localizedName ?? app.bundleIdentifier ?? "Unknown"
-                // Require a real, rendered frame whose X centre falls inside
-                // the notch. Items with zero-size frames are AX entries that
-                // don't correspond to a rendered menu bar icon (Control Centre
-                // exposes many of these as internal children) — including them
-                // floods the panel with phantom entries.
+                // Require a real, rendered frame, then check horizontal overlap
+                // with the notch — any pixel of the icon's frame inside the
+                // notch range counts as clipped (catches partial-overlap cases
+                // like HyperCaps straddling the notch's right edge).
                 guard frame.width > 0, frame.height > 0 else { continue }
-                // Use horizontal overlap, not midX-in-notch — an icon whose
-                // centre is just outside the notch but whose left edge is
-                // inside it is still partially clipped and just as awkward
-                // to click. midX-only missed cases like HyperCaps where the
-                // icon straddles the notch's right edge.
                 guard frame.maxX > notchRange.lowerBound, frame.minX < notchRange.upperBound else { continue }
 
-                log("detectClipped:   CLIPPED  \(appName)  frame=\(frame)  notch=\(notchRange.lowerBound)…\(notchRange.upperBound)")
                 let title = axString(of: item, attribute: kAXTitleAttribute as CFString)
-                result.append(HiddenIcon(
+                let appName = app.localizedName ?? app.bundleIdentifier ?? "Unknown"
+                localClipped.append(HiddenIcon(
                     appName: appName,
                     appIcon: app.icon,
                     title: title,
@@ -483,9 +488,21 @@ enum HiddenIcons {
                     axElement: item
                 ))
             }
+
+            lock.lock()
+            appsWithExtras += 1
+            totalItems += items.count
+            result.append(contentsOf: localClipped)
+            lock.unlock()
         }
 
-        log("detectClipped: walked \(totalApps) apps, \(appsWithExtras) had AXExtrasMenuBar, \(totalItems) total items, \(result.count) clipped")
+        // Log per-clipped-item after the parallel section so log lines stay
+        // sequential and lock contention is zero during AX queries.
+        for clipped in result {
+            log("detectClipped:   CLIPPED  \(clipped.appName)  frame=\(clipped.frame)")
+        }
+        let elapsed = Int(Date().timeIntervalSince(started) * 1000)
+        log("detectClipped: walked \(candidates.count) apps, \(appsWithExtras) had AXExtrasMenuBar, \(totalItems) total items, \(result.count) clipped — \(elapsed)ms")
 
         return result.sorted {
             $0.appName.localizedCaseInsensitiveCompare($1.appName) == .orderedAscending
