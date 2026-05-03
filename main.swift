@@ -243,8 +243,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // just placed an app behind the notch since the last NSWorkspace
         // event fired. Cheap when there's genuinely nothing clipped.
         var items = HiddenIcons.cached
+        HiddenIcons.log("revealHiddenIcons: AX granted=\(axGranted), cache count=\(items.count)")
         if items.isEmpty && axGranted {
+            HiddenIcons.log("revealHiddenIcons: cache empty + AX granted → synchronous detect")
             items = HiddenIcons.detectClipped()
+            HiddenIcons.log("revealHiddenIcons: synchronous detect returned \(items.count) item(s)")
         }
         HiddenIcons.refreshAsync()
 
@@ -305,6 +308,27 @@ struct HiddenIcon {
 
 enum HiddenIcons {
 
+    // MARK: Diagnostic logging
+    //
+    // Writes to /tmp/menutidy.log (never Console). Tail with:
+    //     tail -f /tmp/menutidy.log
+
+    private static let logPath = "/tmp/menutidy.log"
+
+    static func log(_ message: String) {
+        let line = "[\(Date())] \(message)\n"
+        guard let data = line.data(using: .utf8) else { return }
+        if FileManager.default.fileExists(atPath: logPath) {
+            if let handle = FileHandle(forWritingAtPath: logPath) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                try? handle.close()
+            }
+        } else {
+            FileManager.default.createFile(atPath: logPath, contents: data, attributes: nil)
+        }
+    }
+
     // MARK: Live cache
     //
     // Enumerating every app's AXExtrasMenuBar takes ~hundreds of ms because
@@ -329,6 +353,7 @@ enum HiddenIcons {
         cachingStarted = true
 
         lastAXTrusted = AXIsProcessTrusted()
+        log("startCaching: initial AX trusted = \(lastAXTrusted)")
         refreshAsync()
 
         let center = NSWorkspace.shared.notificationCenter
@@ -356,6 +381,7 @@ enum HiddenIcons {
         axPollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
             let now = AXIsProcessTrusted()
             if now != lastAXTrusted {
+                log("AX state flip: \(lastAXTrusted) → \(now)")
                 lastAXTrusted = now
                 if now { refreshAsync() }
             }
@@ -388,18 +414,29 @@ enum HiddenIcons {
     /// items whose logical X centre falls inside the notch's horizontal range
     /// — i.e. the ones the menu bar can't render because the notch is there.
     static func detectClipped() -> [HiddenIcon] {
-        guard let notchRange = notchHorizontalRange() else { return [] }
+        let trusted = AXIsProcessTrusted()
+        guard let notchRange = notchHorizontalRange() else {
+            log("detectClipped: no notch range — skipping (AX trusted: \(trusted))")
+            return []
+        }
+        log("detectClipped: notch X range = \(notchRange.lowerBound)…\(notchRange.upperBound)  AX trusted = \(trusted)")
+
         var result: [HiddenIcon] = []
+        var totalApps = 0
+        var appsWithExtras = 0
+        var totalItems = 0
 
         for app in NSWorkspace.shared.runningApplications {
             guard app.activationPolicy != .prohibited else { continue }
             let pid = app.processIdentifier
             guard pid > 0 else { continue }
+            totalApps += 1
 
             let appEl = AXUIElementCreateApplication(pid)
             var extrasRef: CFTypeRef?
             guard AXUIElementCopyAttributeValue(appEl, "AXExtrasMenuBar" as CFString, &extrasRef) == .success,
                   let extras = extrasRef else { continue }
+            appsWithExtras += 1
             let extrasEl = extras as! AXUIElement
 
             var childrenRef: CFTypeRef?
@@ -407,18 +444,26 @@ enum HiddenIcons {
                   let items = childrenRef as? [AXUIElement] else { continue }
 
             for item in items {
+                totalItems += 1
                 let frame = axFrame(of: item)
+                let appName = app.localizedName ?? app.bundleIdentifier ?? "Unknown"
                 // Require a real, rendered frame whose X centre falls inside
                 // the notch. Items with zero-size frames are AX entries that
                 // don't correspond to a rendered menu bar icon (Control Centre
                 // exposes many of these as internal children) — including them
                 // floods the panel with phantom entries.
                 guard frame.width > 0, frame.height > 0 else { continue }
-                guard notchRange.contains(frame.midX) else { continue }
+                // Use horizontal overlap, not midX-in-notch — an icon whose
+                // centre is just outside the notch but whose left edge is
+                // inside it is still partially clipped and just as awkward
+                // to click. midX-only missed cases like HyperCaps where the
+                // icon straddles the notch's right edge.
+                guard frame.maxX > notchRange.lowerBound, frame.minX < notchRange.upperBound else { continue }
 
+                log("detectClipped:   CLIPPED  \(appName)  frame=\(frame)  notch=\(notchRange.lowerBound)…\(notchRange.upperBound)")
                 let title = axString(of: item, attribute: kAXTitleAttribute as CFString)
                 result.append(HiddenIcon(
-                    appName: app.localizedName ?? app.bundleIdentifier ?? "Unknown",
+                    appName: appName,
                     appIcon: app.icon,
                     title: title,
                     frame: frame,
@@ -426,6 +471,8 @@ enum HiddenIcons {
                 ))
             }
         }
+
+        log("detectClipped: walked \(totalApps) apps, \(appsWithExtras) had AXExtrasMenuBar, \(totalItems) total items, \(result.count) clipped")
 
         return result.sorted {
             $0.appName.localizedCaseInsensitiveCompare($1.appName) == .orderedAscending
