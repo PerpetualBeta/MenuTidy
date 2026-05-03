@@ -155,6 +155,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func statusItemClicked(_ sender: Any?) {
         guard let event = NSApp.currentEvent else { return }
         if event.type == .rightMouseUp {
+            // Pre-warm the hidden-icons cache while the user reads the menu.
+            // Detection takes ~1.5–2s; user takes ~0.5–2s to land on "Reveal
+            // Hidden Icons…" — so the panel usually opens with fresh data
+            // instead of showing the cache for a beat then redrawing.
+            if HiddenIcons.notchHorizontalRange() != nil {
+                HiddenIcons.refreshAsync()
+            }
             showMenu()
         } else {
             toggle()

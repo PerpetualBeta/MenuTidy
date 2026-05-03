@@ -135,6 +135,24 @@ final class JorvikUpdateChecker {
         }
     }
 
+    // MARK: - Bundle ownership
+
+    /// True when the running app's bundle on disk is owned by a uid other
+    /// than the current user — almost always means it was installed via
+    /// `.pkg` (the macOS Installer sets root:wheel ownership), and any
+    /// in-place replacement attempt requires admin authentication.
+    private func bundleNeedsElevatedReplace() -> Bool {
+        let path = Bundle.main.bundleURL.path
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let owner = attrs[.ownerAccountID] as? NSNumber else {
+            // If we can't read attrs, conservatively try unelevated first
+            // — the only loss is one wasted attempt before the user sees
+            // the existing failure path.
+            return false
+        }
+        return owner.uint32Value != getuid()
+    }
+
     // MARK: - Auto-install
 
     @MainActor
@@ -170,12 +188,23 @@ final class JorvikUpdateChecker {
                 return
             }
 
-            // Replace the running app using a post-quit shell script
-            // (FileManager can't move SIP-protected signed bundles while running)
+            // Replace the running app using a post-quit shell script.
+            // FileManager can't move SIP-protected signed bundles while
+            // running; we have to detach a script that waits for us to quit
+            // and then does the move.
+            //
+            // Privilege handling: when the app was installed via .pkg, the
+            // bundle is owned by root:wheel and the user can't rm-rf it.
+            // Detect ownership; if root-owned, run the same script as root
+            // via NSAppleScript's "with administrator privileges" — the user
+            // sees one Touch ID / password prompt per update. If user-owned
+            // (zip-installed, dragged in), no elevation needed.
             let currentAppURL = Bundle.main.bundleURL
             let currentPath = currentAppURL.path
             let newAppPath = appBundle.path
             let pid = ProcessInfo.processInfo.processIdentifier
+            let uid = getuid()
+            let needsElevation = bundleNeedsElevatedReplace()
 
             let script = """
             #!/bin/bash
@@ -185,10 +214,11 @@ final class JorvikUpdateChecker {
             rm -rf '\(currentPath)'
             # Move new app into place
             mv '\(newAppPath)' '\(currentPath)'
-            # Clean up
+            \(needsElevation ? "# Restore root ownership to match the original .pkg install\nchown -R root:wheel '\(currentPath)'" : "")
+            # Clean up the extracted dir
             rm -rf '\(extractDir.path)'
-            # Relaunch
-            open '\(currentPath)'
+            # Relaunch as the user (works whether we're running as root or user)
+            launchctl asuser \(uid) /usr/bin/open '\(currentPath)'
             # Self-destruct
             rm -f /tmp/jorvik_update.sh
             """
@@ -202,10 +232,31 @@ final class JorvikUpdateChecker {
             try chmod.run()
             chmod.waitUntilExit()
 
-            let launcher = Process()
-            launcher.executableURL = URL(fileURLWithPath: "/bin/bash")
-            launcher.arguments = [scriptPath]
-            try launcher.run()
+            if needsElevation {
+                // do shell script blocks; launch the bash script detached
+                // so AppleScript returns immediately (otherwise it would
+                // wait forever, and the bash script is itself waiting for
+                // us to quit).
+                let appleScriptSource = #"do shell script "nohup /bin/bash \#(scriptPath) </dev/null >/dev/null 2>&1 &" with administrator privileges"#
+                guard let osa = NSAppleScript(source: appleScriptSource) else {
+                    status = .error("Could not compile updater")
+                    return
+                }
+                var asError: NSDictionary?
+                _ = osa.executeAndReturnError(&asError)
+                if let asError {
+                    let brief = (asError["NSAppleScriptErrorBriefMessage"] as? String)
+                        ?? (asError["NSAppleScriptErrorMessage"] as? String)
+                        ?? "authentication required"
+                    status = .error("Update cancelled — \(brief)")
+                    return
+                }
+            } else {
+                let launcher = Process()
+                launcher.executableURL = URL(fileURLWithPath: "/bin/bash")
+                launcher.arguments = [scriptPath]
+                try launcher.run()
+            }
 
             // Quit so the script can replace us
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
