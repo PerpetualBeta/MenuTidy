@@ -20,10 +20,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // Sparkle handles the actual update checking and installation. The
     // legacy JorvikUpdateChecker is kept for the Settings UI continuity but
     // its scheduled check is suppressed below.
-    let sparkleUpdater = SPUStandardUpdaterController(
+    let userDriverDelegate = MenuTidyUserDriverDelegate()
+    lazy var sparkleUpdater = SPUStandardUpdaterController(
         startingUpdater: true,
         updaterDelegate: nil,
-        userDriverDelegate: nil
+        userDriverDelegate: userDriverDelegate
     )
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -318,6 +319,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             target: self,
             actions: actions
         )
+    }
+}
+
+// MARK: - Sparkle User Driver Delegate
+
+/// Brings MenuTidy to the front before Sparkle shows any modal dialog —
+/// "you're up to date", "an update is available", error alerts. Without
+/// this, Sparkle's NSAlert appears but stays behind whatever app is
+/// currently key, because LSUIElement apps don't auto-activate when they
+/// present windows. The user has to hide/minimise other apps to find
+/// the dialog. One call to NSApp.activate fixes it cleanly.
+final class MenuTidyUserDriverDelegate: NSObject, SPUStandardUserDriverDelegate {
+    func standardUserDriverWillShowModalAlert() {
+        NSApp.activate(ignoringOtherApps: true)
     }
 }
 
