@@ -2,6 +2,7 @@ import Cocoa
 import ServiceManagement
 import SwiftUI
 import ApplicationServices
+import Sparkle
 
 // MARK: - App Delegate
 
@@ -16,12 +17,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private let didSeedDefaultPositionsKey = "MenuTidy_DidSeedDefaultPositions"
     let updateChecker = JorvikUpdateChecker(repoName: "MenuTidy")
 
+    // Sparkle handles the actual update checking and installation. The
+    // legacy JorvikUpdateChecker is kept for the Settings UI continuity but
+    // its scheduled check is suppressed below.
+    let sparkleUpdater = SPUStandardUpdaterController(
+        startingUpdater: true,
+        updaterDelegate: nil,
+        userDriverDelegate: nil
+    )
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         migrateLegacyPillColorKey()
 
         setupStatusItems()
         setupCmdKeyMonitor()
-        updateChecker.checkOnSchedule()
+        // updateChecker.checkOnSchedule()  // disabled; Sparkle handles it now
 
         // Pre-warm the hidden-icons cache so opening the reveal panel is
         // instant. Only meaningful on notched displays — gated to avoid
@@ -213,6 +223,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
+    @objc func checkForUpdates(_ sender: Any?) {
+        sparkleUpdater.checkForUpdates(sender)
+    }
+
     @objc func openSettings() {
         JorvikSettingsView.showWindow(
             appName: "MenuTidy",
@@ -289,6 +303,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 target: self
             ))
         }
+
+        actions.append(.init(title: "-", action: #selector(NSObject.description), target: self))
+        actions.append(.init(
+            title: "Check for Updates\u{2026}",
+            action: #selector(checkForUpdates(_:)),
+            target: self
+        ))
 
         return JorvikMenuBuilder.buildMenu(
             appName: "MenuTidy",
