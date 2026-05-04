@@ -61,6 +61,7 @@ Right-click the chevron for the standard Jorvik menu:
 
 - **About MenuTidy**
 - **Reveal Hidden Icons…** — only shown on Macs with a notch (see below)
+- **Check for Updates…** — runs a Sparkle-powered update check
 - **Settings…**
 - **Quit MenuTidy** — exit the app (all hidden icons reappear)
 
@@ -78,8 +79,9 @@ The menu item only appears on notched displays. The first time you use it MenuTi
 
 - **Permissions → Accessibility** — required for **Reveal Hidden Icons**; shows live status with a Grant Access button if not yet granted
 - **Menu bar icon pill** — optional grey background for stronger contrast on busy or wallpaper-tinted menu bars (off by default)
-- **Launch at Login** — start MenuTidy automatically when you log in
-- **Auto-update** — check for new versions on a configurable schedule with optional automatic installation
+- **General → Launch at Login** — start MenuTidy automatically when you log in
+
+Auto-updates are handled by Sparkle. Use the **Check for Updates…** menu item to check on demand; Sparkle's prompt offers an "Automatically download and install updates in the future" checkbox the first time an update is available.
 
 ## Behaviour on Restart
 
