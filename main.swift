@@ -562,10 +562,7 @@ enum HiddenIcons {
             var localClipped: [HiddenIcon] = []
             for item in items {
                 let frame = axFrame(of: item)
-                // Require a real, rendered frame, then check horizontal overlap
-                // with the notch — any pixel of the icon's frame inside the
-                // notch range counts as clipped (catches partial-overlap cases
-                // like HyperCaps straddling the notch's right edge).
+                // Require a real, rendered frame.
                 guard frame.width > 0, frame.height > 0 else { continue }
                 // Sanity check: real menu bar status items are 20–60pt wide.
                 // AX occasionally returns bogus aggregate frames (Control Centre
@@ -574,7 +571,27 @@ enum HiddenIcons {
                 // wider than the notch itself can't be a partially-clipped
                 // status item — it's a misreported aggregate.
                 guard frame.width <= 200 else { continue }
-                guard frame.maxX > notchRange.lowerBound, frame.minX < notchRange.upperBound else { continue }
+                // An item is hidden by the notch in two distinct ways:
+                //
+                //   1. *Partial* clip — the frame straddles the notch range
+                //      (e.g. ScreenLock at x=794, ShortcutHUD at x=690 with
+                //      a notch at 663–848). The visible portion peeks out
+                //      one side of the notch.
+                //
+                //   2. *Full* clip — the menu bar didn't have enough room
+                //      for this item once the notch consumed its space, so
+                //      macOS pushed the entire item off-screen to the left.
+                //      AX reports a far-negative x sentinel (typically
+                //      around -4000pt). A purely-overlap predicate misses
+                //      these because their frame isn't anywhere near the
+                //      notch range geometrically.
+                //
+                // Catch both. `maxX <= 0` is a clean signal for case 2 —
+                // legitimately-visible left-of-notch items report small
+                // positive maxX (their visible portion sits at x ≥ 0).
+                let overlapsNotch = frame.maxX > notchRange.lowerBound && frame.minX < notchRange.upperBound
+                let pushedOffscreenLeft = frame.maxX <= 0
+                guard overlapsNotch || pushedOffscreenLeft else { continue }
 
                 let title = axString(of: item, attribute: kAXTitleAttribute as CFString)
                 let appName = app.localizedName ?? app.bundleIdentifier ?? "Unknown"
