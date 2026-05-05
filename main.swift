@@ -269,10 +269,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         revealPanel = panel
 
-        // Live-update the panel with the post-refresh list. If items differ
-        // (count or membership), rebuild — common when the menu bar has
-        // shifted between cache time and panel open.
-        HiddenIcons.refreshAsync { [weak panel] fresh in
+        // Live-update the panel with the post-refresh list. Use a *full*
+        // walk here, not the fast cached one: an app that launched after
+        // the last full enumeration (or that slow-started past the 1.5 s
+        // post-launch refresh window) won't be in the host-PID cache, so
+        // a fast walk would never see it. The full walk takes ~1.6 s but
+        // runs in the background and updates the panel in place when it
+        // completes — the user sees the cached snapshot first and the
+        // refreshed list a moment later.
+        HiddenIcons.refreshAsyncFull { [weak panel] fresh in
             guard let panel, panel.isVisible else { return }
             panel.updateItems(fresh)
         }
@@ -440,9 +445,16 @@ enum HiddenIcons {
             object: nil,
             queue: .main
         ) { note in
-            // The new app might be a status-item host. Small delay so it has
-            // time to create its NSStatusItem; full walk picks it up.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { refreshAsyncFull() }
+            // The new app might be a status-item host. Schedule several
+            // refreshes at backoff intervals — quick-starting apps are
+            // caught at 1.5 s, slow-starting apps (especially Electron
+            // wrappers and apps that wait on network/login before
+            // surfacing their NSStatusItem) at 5 s or 15 s. Each pass
+            // is idempotent; the cost is three extra full walks per
+            // launch event, which is fine.
+            for delay in [1.5, 5.0, 15.0] {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { refreshAsyncFull() }
+            }
         }
         center.addObserver(
             forName: NSWorkspace.didTerminateApplicationNotification,
@@ -487,10 +499,13 @@ enum HiddenIcons {
     /// host-PID cache. Used on launch, on AX permission flips, and on app
     /// launch / terminate notifications so any newly-introduced hoster
     /// (or removed one) is reflected in subsequent fast refreshes.
-    static func refreshAsyncFull() {
+    static func refreshAsyncFull(completion: (([HiddenIcon]) -> Void)? = nil) {
         DispatchQueue.global(qos: .utility).async {
             let items = detectClippedFull()
             cacheQueue.sync { _cached = items }
+            if let completion {
+                DispatchQueue.main.async { completion(items) }
+            }
         }
     }
 
