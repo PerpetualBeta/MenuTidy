@@ -15,11 +15,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var isCollapsed = false
     private let hasLaunchedBeforeKey = "MenuTidy_HasLaunchedBefore"
     private let didSeedDefaultPositionsKey = "MenuTidy_DidSeedDefaultPositions"
-    let updateChecker = JorvikUpdateChecker(repoName: "MenuTidy")
 
-    // Sparkle handles the actual update checking and installation. The
-    // legacy JorvikUpdateChecker is kept for the Settings UI continuity but
-    // its scheduled check is suppressed below.
     let userDriverDelegate = MenuTidyUserDriverDelegate()
     lazy var sparkleUpdater = SPUStandardUpdaterController(
         startingUpdater: true,
@@ -32,7 +28,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         setupStatusItems()
         setupCmdKeyMonitor()
-        // updateChecker.checkOnSchedule()  // disabled; Sparkle handles it now
 
         // Pre-warm the hidden-icons cache so opening the reveal panel is
         // instant. Only meaningful on notched displays — gated to avoid
@@ -230,10 +225,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func openSettings() {
-        JorvikSettingsView.showWindow(
-            appName: "MenuTidy",
-            updateChecker: updateChecker
-        ) { [weak self] in
+        JorvikSettingsView.showWindow(appName: "MenuTidy") { [weak self] in
             MenuTidySettingsContent { self?.updateIcon() }
         }
     }
