@@ -95,11 +95,11 @@ MenuTidy is a single-file Swift app with no dependencies beyond macOS system fra
 
 ```bash
 cd ~/Desktop/Jorvik\ Software/MenuTidy
-./build.sh
-open MenuTidy.app
+gmake build
+open .build/MenuTidy.app
 ```
 
-The build script compiles `main.swift` with `swiftc`, links against Cocoa and ServiceManagement, and assembles the `.app` bundle.
+Requires GNU Make 4.x — `brew install make` installs it as `gmake`. The target is defined in the shared `release.mk` from `jorvik-release/`.
 
 ## Troubleshooting
 
