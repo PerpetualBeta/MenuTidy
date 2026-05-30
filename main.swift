@@ -186,9 +186,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
             let frame = window.frame
-            // Chevron is off-screen if it's been pushed past the left edge
-            // or squeezed to nothing
-            if frame.width < 5 || frame.maxX < 50 || frame.minX < 0 {
+            // Test against the chevron's OWN display, not global (0,0). With
+            // "Displays have separate Spaces", the chevron's window moves to
+            // whichever display is active; a display arranged left of the main
+            // one lives in negative-x global space, so absolute checks
+            // (maxX < 50, minX < 0) fire spuriously there and we'd "collapse
+            // then immediately reopen". (GitHub issue #1.)
+            let screenFrame = (window.screen
+                ?? NSScreen.screens.first { $0.frame.intersects(frame) }
+                ?? NSScreen.main)?.frame
+            guard let screenFrame else {
+                self.expand()   // not on any screen → genuinely off-screen
+                return
+            }
+            // Chevron is off-screen if squeezed to nothing, or pushed past the
+            // left edge of its own display.
+            if frame.width < 5
+                || frame.maxX < screenFrame.minX + 50
+                || frame.minX < screenFrame.minX {
                 self.expand()
             }
         }
