@@ -44,6 +44,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             UserDefaults.standard.set(true, forKey: hasLaunchedBeforeKey)
         }
+
+        // Redraw the status icon when the display configuration changes — the
+        // menu bar's effective thickness can shrink (e.g. moving from a notched
+        // display to an external one) and leave the pre-rendered pill cropped.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.updateIcon()
+        }
     }
 
     // One-shot removal of the user-chosen pill colour key from the old design.
