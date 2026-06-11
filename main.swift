@@ -4,6 +4,41 @@ import SwiftUI
 import ApplicationServices
 import Sparkle
 
+// MARK: - Debug logging
+//
+// Off by default. Enable per-machine with:
+//   defaults write cc.jorviksoftware.MenuTidy debugLogging -bool YES
+// Lines append to ~/Library/Logs/MenuTidy/menutidy.log. Never to stderr/Console,
+// never to /tmp. Used to dump hidden-icon AX geometry when diagnosing reveal
+// counts; the flag-read is cached once so the hot detection loop stays cheap.
+enum MTDebug {
+    static let enabled = UserDefaults.standard.bool(forKey: "debugLogging")
+
+    private static let handle: FileHandle? = {
+        guard enabled else { return nil }
+        let dir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/MenuTidy", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("menutidy.log")
+        if !FileManager.default.fileExists(atPath: url.path) {
+            FileManager.default.createFile(atPath: url.path, contents: nil)
+        }
+        let h = try? FileHandle(forWritingTo: url)
+        _ = try? h?.seekToEnd()
+        return h
+    }()
+
+    private static let lock = NSLock()
+
+    static func log(_ message: @autoclosure () -> String) {
+        guard enabled, let handle else { return }
+        let line = message() + "\n"
+        guard let data = line.data(using: .utf8) else { return }
+        lock.lock(); defer { lock.unlock() }
+        handle.write(data)
+    }
+}
+
 // MARK: - App Delegate
 
 class AppDelegate: NSObject, NSApplicationDelegate {
@@ -569,6 +604,11 @@ enum HiddenIcons {
     /// host-PID cache from the apps that returned a non-nil AXExtrasMenuBar.
     private static func walk(candidates: [NSRunningApplication], isFullWalk: Bool) -> [HiddenIcon] {
         guard let notchRange = notchHorizontalRange() else { return [] }
+        // Left edge of the main screen in global coordinates — the boundary an
+        // overflow status item is clipped against. 0 on a single-screen setup.
+        let screenMinX = NSScreen.main?.frame.minX ?? 0
+
+        MTDebug.log("--- walk (\(isFullWalk ? "full" : "fast")) notch=\(notchRange.lowerBound)...\(notchRange.upperBound) screenMinX=\(screenMinX) ---")
 
         let lock = NSLock()
         var result: [HiddenIcon] = []
@@ -622,11 +662,29 @@ enum HiddenIcons {
                 // legitimately-visible left-of-notch items report small
                 // positive maxX (their visible portion sits at x ≥ 0).
                 let overlapsNotch = frame.maxX > notchRange.lowerBound && frame.minX < notchRange.upperBound
-                let pushedOffscreenLeft = frame.maxX <= 0
-                guard overlapsNotch || pushedOffscreenLeft else { continue }
+                // Left-clipped: either flung to the far-negative off-screen
+                // sentinel (hidden mode shoves overflow items to ~-4000) OR
+                // straddling/over the left screen edge. The old test was
+                // `maxX <= 0`, which only caught the fully-off-screen case —
+                // it missed items poking just past the left edge (minX < edge
+                // but maxX > 0). That gap is why exposing icons dropped the
+                // reveal count below the true hidden total: in exposed mode the
+                // collapsed spacer leaves overflow items only a little past the
+                // edge (maxX positive), so they slipped through as "visible".
+                let clippedLeftEdge = frame.minX < screenMinX
+                let isHidden = overlapsNotch || clippedLeftEdge
 
                 let title = axString(of: item, attribute: kAXTitleAttribute as CFString)
                 let appName = app.localizedName ?? app.bundleIdentifier ?? "Unknown"
+
+                MTDebug.log(String(format: "item %@ '%@' frame=[x=%.0f w=%.0f maxX=%.0f] overlapsNotch=%@ clippedLeft=%@ -> %@",
+                                   appName, title ?? "",
+                                   frame.minX, frame.width, frame.maxX,
+                                   overlapsNotch ? "Y" : "n",
+                                   clippedLeftEdge ? "Y" : "n",
+                                   isHidden ? "HIDDEN" : "visible"))
+
+                guard isHidden else { continue }
                 localClipped.append(HiddenIcon(
                     appName: appName,
                     appIcon: app.icon,
