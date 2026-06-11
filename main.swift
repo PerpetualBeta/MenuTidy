@@ -604,11 +604,11 @@ enum HiddenIcons {
     /// host-PID cache from the apps that returned a non-nil AXExtrasMenuBar.
     private static func walk(candidates: [NSRunningApplication], isFullWalk: Bool) -> [HiddenIcon] {
         guard let notchRange = notchHorizontalRange() else { return [] }
-        // Left edge of the main screen in global coordinates — the boundary an
-        // overflow status item is clipped against. 0 on a single-screen setup.
-        let screenMinX = NSScreen.main?.frame.minX ?? 0
+        // Right edge of the main screen in global coordinates — a visible item
+        // must lie within it. `screenMaxX` guards the (rare) off-the-right case.
+        let screenMaxX = NSScreen.main?.frame.maxX ?? .greatestFiniteMagnitude
 
-        MTDebug.log("--- walk (\(isFullWalk ? "full" : "fast")) notch=\(notchRange.lowerBound)...\(notchRange.upperBound) screenMinX=\(screenMinX) ---")
+        MTDebug.log("--- walk (\(isFullWalk ? "full" : "fast")) notch=\(notchRange.lowerBound)...\(notchRange.upperBound) screenMaxX=\(screenMaxX) ---")
 
         let lock = NSLock()
         var result: [HiddenIcon] = []
@@ -661,27 +661,37 @@ enum HiddenIcons {
                 // Catch both. `maxX <= 0` is a clean signal for case 2 —
                 // legitimately-visible left-of-notch items report small
                 // positive maxX (their visible portion sits at x ≥ 0).
-                let overlapsNotch = frame.maxX > notchRange.lowerBound && frame.minX < notchRange.upperBound
-                // Left-clipped: either flung to the far-negative off-screen
-                // sentinel (hidden mode shoves overflow items to ~-4000) OR
-                // straddling/over the left screen edge. The old test was
-                // `maxX <= 0`, which only caught the fully-off-screen case —
-                // it missed items poking just past the left edge (minX < edge
-                // but maxX > 0). That gap is why exposing icons dropped the
-                // reveal count below the true hidden total: in exposed mode the
-                // collapsed spacer leaves overflow items only a little past the
-                // edge (maxX positive), so they slipped through as "visible".
-                let clippedLeftEdge = frame.minX < screenMinX
-                let isHidden = overlapsNotch || clippedLeftEdge
+                // On a notched display, status items are only ever *visible*
+                // to the RIGHT of the notch (the strip left of the notch is
+                // app-menu territory). So an item is visible iff it sits fully
+                // right of the notch and on-screen. Everything else is hidden:
+                //   - overlapping the notch (partial clip),
+                //   - parked just LEFT of the notch (overflow that didn't fit
+                //     right of it — these tile leftward from the notch; an
+                //     earlier `overlapsNotch || maxX<=0` test wrongly counted
+                //     them as visible, which is why exposing dropped icons like
+                //     AdGuard Mini / RainbowApple / MirrorGuard from the panel),
+                //   - flung off-screen-left to the spacer's ~-4000 sentinel.
+                let visibleRightOfNotch = frame.minX >= notchRange.upperBound && frame.minX < screenMaxX
+                // Unplaced sentinel: some apps register a status item they
+                // aren't actually showing; AX parks it at the screen's far-left
+                // origin (x≈-1…7, so a tiny positive maxX). No real status
+                // item — visible or overflow — lives in that Apple-menu strip,
+                // so a frame whose right edge is within 50pt of the origin is
+                // junk, not a hidden icon. (The off-screen-left sentinel has
+                // maxX <= 0, so `maxX > 0` keeps it out of this exclusion and
+                // it stays correctly counted as hidden.)
+                let unplacedSentinel = frame.maxX > 0 && frame.maxX <= 50
+                let isHidden = !visibleRightOfNotch && !unplacedSentinel
 
                 let title = axString(of: item, attribute: kAXTitleAttribute as CFString)
                 let appName = app.localizedName ?? app.bundleIdentifier ?? "Unknown"
 
-                MTDebug.log(String(format: "item %@ '%@' frame=[x=%.0f w=%.0f maxX=%.0f] overlapsNotch=%@ clippedLeft=%@ -> %@",
+                MTDebug.log(String(format: "item %@ '%@' frame=[x=%.0f w=%.0f maxX=%.0f] visibleRight=%@ unplaced=%@ -> %@",
                                    appName, title ?? "",
                                    frame.minX, frame.width, frame.maxX,
-                                   overlapsNotch ? "Y" : "n",
-                                   clippedLeftEdge ? "Y" : "n",
+                                   visibleRightOfNotch ? "Y" : "n",
+                                   unplacedSentinel ? "Y" : "n",
                                    isHidden ? "HIDDEN" : "visible"))
 
                 guard isHidden else { continue }
