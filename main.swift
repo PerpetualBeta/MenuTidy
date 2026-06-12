@@ -45,6 +45,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var chevronItem: NSStatusItem!
     var spacerItem: NSStatusItem!
     var cmdMonitor: Any?
+    var mouseMonitor: Any?
+    var spacerVisible = false
     var revealPanel: HiddenIconsPanel?
 
     var isCollapsed = false
@@ -140,17 +142,58 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func setupCmdKeyMonitor() {
         cmdMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
             guard let self else { return }
-            let cmdPressed = event.modifierFlags.contains(.command)
-            if cmdPressed {
-                self.showSpacer()
+            if event.modifierFlags.contains(.command) {
+                self.beginPointerTracking()
             } else {
-                self.hideSpacer()
+                self.endPointerTracking()
             }
         }
     }
 
+    // The highlight is a wayfinding aid for someone arranging their menu bar,
+    // so it should only appear when the pointer is actually up there. ⌘ alone
+    // isn't enough — it's pressed constantly for ordinary shortcuts. While the
+    // key is held we follow the cursor and reveal the spacer only when it
+    // enters the menu-bar band; releasing ⌘ tears the tracking back down.
+    func beginPointerTracking() {
+        if mouseMonitor == nil {
+            mouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: .mouseMoved) { [weak self] _ in
+                self?.updateSpacerForPointer()
+            }
+        }
+        updateSpacerForPointer()
+    }
+
+    func endPointerTracking() {
+        if let mouseMonitor {
+            NSEvent.removeMonitor(mouseMonitor)
+            self.mouseMonitor = nil
+        }
+        hideSpacer()
+    }
+
+    func updateSpacerForPointer() {
+        if pointerInMenuBar() {
+            showSpacer()
+        } else {
+            hideSpacer()
+        }
+    }
+
+    /// True when the cursor sits within the menu-bar band at the top of
+    /// whichever screen it's currently on. Thickness is queried live so a
+    /// notched built-in display and a shorter external bar both read correctly.
+    private func pointerInMenuBar() -> Bool {
+        let loc = NSEvent.mouseLocation
+        guard let screen = NSScreen.screens.first(where: { NSMouseInRect(loc, $0.frame, false) }) else {
+            return false
+        }
+        return loc.y >= screen.frame.maxY - NSStatusBar.system.thickness
+    }
+
     func showSpacer() {
-        guard !isCollapsed else { return }
+        guard !isCollapsed, !spacerVisible else { return }
+        spacerVisible = true
         spacerItem.length = 10
         if let button = spacerItem.button {
             button.title = ""
@@ -187,6 +230,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func hideSpacer() {
+        spacerVisible = false
         guard !isCollapsed else { return }
         spacerItem.length = 0
         spacerItem.button?.image = nil
