@@ -49,6 +49,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var spacerVisible = false
     var revealPanel: HiddenIconsPanel?
 
+    // Auto-collapse (opt-in). When enabled, the bar tidies itself a short delay
+    // after the pointer leaves the menu-bar vicinity, so an expand-to-peek
+    // doesn't leave the bar open indefinitely. Config is read once at launch
+    // (see applicationDidFinishLaunching), matching the debugLogging flag.
+    var autoCollapseMouseMonitor: Any?
+    var autoCollapsePending: DispatchWorkItem?
+    private var autoCollapseEnabled = false
+    private var autoCollapseDelay: TimeInterval = 2   // "a couple of seconds"
+
     var isCollapsed = false
     private let hasLaunchedBeforeKey = "MenuTidy_HasLaunchedBefore"
     private let didSeedDefaultPositionsKey = "MenuTidy_DidSeedDefaultPositions"
@@ -62,6 +71,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         migrateLegacyPillColorKey()
+
+        // Auto-collapse config (opt-in, off by default). Enable per-machine:
+        //   defaults write cc.jorviksoftware.MenuTidy autoCollapse -bool YES
+        // Optionally tune the delay in seconds (default 2):
+        //   defaults write cc.jorviksoftware.MenuTidy autoCollapseDelay -int 3
+        // Read once here so the pointer-tracking hot path stays free of
+        // UserDefaults lookups; a change takes effect on the next launch.
+        autoCollapseEnabled = UserDefaults.standard.bool(forKey: "autoCollapse")
+        let configuredDelay = UserDefaults.standard.double(forKey: "autoCollapseDelay")
+        if configuredDelay > 0 { autoCollapseDelay = configuredDelay }
 
         setupStatusItems()
         setupCmdKeyMonitor()
@@ -103,7 +122,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        expand()
+        expand(startTracking: false)
     }
 
     // MARK: Status Items
@@ -260,10 +279,79 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if isCollapsed { expand() } else { collapse() }
     }
 
+    // MARK: Auto-collapse (opt-in)
+    //
+    // Only active when `autoCollapse` is set. Tracking is installed while the
+    // bar is expanded and torn down when it collapses, so there's zero hot-path
+    // cost when the bar is already tidy or the feature is off. "Vicinity" is the
+    // menu-bar band itself (the same predicate the ⌘ spacer-reveal uses); the
+    // couple-second delay is the grace window, so a brief dip below the bar
+    // doesn't tidy prematurely.
+    //
+    // Known limitation: navigating a tall drop-down opened from a hidden-group
+    // icon for longer than the delay can trigger a collapse mid-menu, since the
+    // pointer is below the band the whole time. Rare in practice, and the
+    // affected item reappears on the next expand.
+
+    /// Begin watching the pointer so we can auto-collapse once it leaves the
+    /// menu-bar vicinity. Called whenever the bar expands. Idempotent, and a
+    /// no-op unless the feature is enabled.
+    func startAutoCollapseTracking() {
+        guard autoCollapseEnabled, autoCollapseMouseMonitor == nil else { return }
+        MTDebug.log("auto-collapse: tracking started (delay=\(autoCollapseDelay)s)")
+        autoCollapseMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: .mouseMoved) { [weak self] _ in
+            self?.evaluateAutoCollapse()
+        }
+        // The pointer may already be away from the bar at expand time (the user
+        // clicked the chevron and the cursor is drifting off), so evaluate once
+        // now rather than waiting for the next move event.
+        evaluateAutoCollapse()
+    }
+
+    func stopAutoCollapseTracking() {
+        if let autoCollapseMouseMonitor {
+            NSEvent.removeMonitor(autoCollapseMouseMonitor)
+            self.autoCollapseMouseMonitor = nil
+        }
+        autoCollapsePending?.cancel()
+        autoCollapsePending = nil
+    }
+
+    /// Arm the collapse countdown while the pointer is outside the vicinity;
+    /// cancel it the moment it returns. Armed only once on leaving (guarded by
+    /// `autoCollapsePending == nil`) so continued movement outside the band
+    /// doesn't keep resetting it — the collapse fires a fixed delay after the
+    /// pointer *first* left.
+    private func evaluateAutoCollapse() {
+        guard autoCollapseEnabled, !isCollapsed else { return }
+        if pointerInMenuBar() {
+            if autoCollapsePending != nil {
+                MTDebug.log("auto-collapse: countdown cancelled (pointer back at bar)")
+            }
+            autoCollapsePending?.cancel()
+            autoCollapsePending = nil
+        } else if autoCollapsePending == nil {
+            MTDebug.log("auto-collapse: countdown armed")
+            let work = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.autoCollapsePending = nil
+                // Re-check at fire time: the pointer may have returned to the
+                // bar without a move event the monitor observed.
+                guard self.autoCollapseEnabled, !self.isCollapsed,
+                      !self.pointerInMenuBar() else { return }
+                MTDebug.log("auto-collapse: firing collapse")
+                self.collapse()
+            }
+            autoCollapsePending = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + autoCollapseDelay, execute: work)
+        }
+    }
+
     // MARK: Collapse / Expand
 
     func collapse() {
         isCollapsed = true
+        stopAutoCollapseTracking()
         spacerItem.length = 10_000
         updateIcon()
 
@@ -271,7 +359,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
             guard let self else { return }
             guard let window = self.chevronItem.button?.window else {
-                self.expand()
+                self.expand(startTracking: false)
                 return
             }
             let frame = window.frame
@@ -285,7 +373,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 ?? NSScreen.screens.first { $0.frame.intersects(frame) }
                 ?? NSScreen.main)?.frame
             guard let screenFrame else {
-                self.expand()   // not on any screen → genuinely off-screen
+                self.expand(startTracking: false)   // not on any screen → genuinely off-screen
                 return
             }
             // Chevron is off-screen if squeezed to nothing, or pushed past the
@@ -293,15 +381,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if frame.width < 5
                 || frame.maxX < screenFrame.minX + 50
                 || frame.minX < screenFrame.minX {
-                self.expand()
+                self.expand(startTracking: false)
             }
         }
     }
 
-    func expand() {
+    // `startTracking` lets the safety-revert path below re-expand without
+    // re-arming auto-collapse — otherwise a chevron pushed off-screen (a broken
+    // arrangement) would collapse, revert, and collapse again on a loop.
+    func expand(startTracking: Bool = true) {
         isCollapsed = false
         spacerItem.length = 0
         updateIcon()
+        if startTracking {
+            startAutoCollapseTracking()
+        }
     }
 
     // MARK: Menu

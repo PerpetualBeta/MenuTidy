@@ -89,6 +89,28 @@ Auto-updates are handled by Sparkle. Use the **Check for Updates…** menu item 
 - Other apps' icon positions are preserved by macOS in their own preferences, so the layout you build once stays put
 - On subsequent launches, MenuTidy automatically collapses after a short delay to let all icons load into their saved positions first
 
+## Auto-collapse (advanced)
+
+By default the bar stays in whatever state you left it — expand to peek at your icons, and it waits for you to click again to tidy. If you'd rather it re-tidy itself, MenuTidy can auto-collapse a couple of seconds after the pointer leaves the menu bar. It's off by default; enable it per-machine with:
+
+```bash
+defaults write cc.jorviksoftware.MenuTidy autoCollapse -bool YES
+```
+
+The delay is two seconds by default. To change it, set a value in seconds:
+
+```bash
+defaults write cc.jorviksoftware.MenuTidy autoCollapseDelay -int 3
+```
+
+Both are read at launch, so quit and relaunch MenuTidy for a change to take effect. To turn it back off:
+
+```bash
+defaults write cc.jorviksoftware.MenuTidy autoCollapse -bool NO
+```
+
+The countdown starts when the pointer leaves the menu bar and is cancelled if you move back up to it before it elapses — so the bar only tidies once you've genuinely moved away.
+
 ## Building from Source
 
 MenuTidy is a single-file Swift app with no dependencies beyond macOS system frameworks. No Xcode project is required.
