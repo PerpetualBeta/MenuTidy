@@ -71,7 +71,7 @@ On 14"/16" MacBook Pros and notched MacBook Airs, the menu bar wraps around the 
 
 MenuTidy's **Reveal Hidden Icons…** menu item drops a panel listing every status icon currently hidden behind the notch. **Left-click** an entry to activate that icon's primary action (or open its menu, if it's a menu-style item); **right-click** to send a right-click instead, for icons that distinguish the two.
 
-Each time you open the panel it scans the menu bar fresh — a brief spinner shows while it works, then the complete list appears, so you always know you're looking at the final result. Opening **Reveal Hidden Icons** again closes the panel; it also closes if you collapse the menu bar.
+Each time you open the panel it scans the menu bar fresh — a brief spinner shows while it works, then the complete list appears, so you always know you're looking at the final result. Clicking **Reveal Hidden Icons** again closes the panel; it also closes if you collapse the menu bar.
 
 The menu item only appears on notched displays. The first time you use it MenuTidy will ask for Accessibility permission so it can enumerate other apps' status items; you can also grant it ahead of time from **Settings → Permissions**.
 
