@@ -48,6 +48,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var mouseMonitor: Any?
     var spacerVisible = false
     var revealPanel: HiddenIconsPanel?
+    // Captured when the right-click menu is built: opening that menu dismisses
+    // the panel (resignKey) before the menu item fires, so we can't ask the live
+    // panel whether it was open — we decide the toggle from this snapshot.
+    var revealPanelWasOpenAtMenuInvoke = false
 
     // Auto-collapse (opt-in). When enabled, the bar tidies itself a short delay
     // after the pointer leaves the menu-bar vicinity, so an expand-to-peek
@@ -317,6 +321,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         autoCollapsePending = nil
     }
 
+    /// True while the Reveal Hidden Icons panel is on screen. Auto-collapse must
+    /// stand down then: collapsing reflows the menu bar under the open panel and
+    /// moves the very icon the user is reaching for out from under the cursor.
+    private var revealPanelOpen: Bool { revealPanel?.isVisible == true }
+
     /// Arm the collapse countdown while the pointer is outside the vicinity;
     /// cancel it the moment it returns. Armed only once on leaving (guarded by
     /// `autoCollapsePending == nil`) so continued movement outside the band
@@ -324,9 +333,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// pointer *first* left.
     private func evaluateAutoCollapse() {
         guard autoCollapseEnabled, !isCollapsed else { return }
-        if pointerInMenuBar() {
+        // Hold the countdown while the pointer is at the bar OR the Reveal panel
+        // is open — either means "don't tidy yet".
+        if pointerInMenuBar() || revealPanelOpen {
             if autoCollapsePending != nil {
-                MTDebug.log("auto-collapse: countdown cancelled (pointer back at bar)")
+                MTDebug.log("auto-collapse: countdown cancelled (pointer at bar or reveal open)")
             }
             autoCollapsePending?.cancel()
             autoCollapsePending = nil
@@ -336,9 +347,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self else { return }
                 self.autoCollapsePending = nil
                 // Re-check at fire time: the pointer may have returned to the
-                // bar without a move event the monitor observed.
+                // bar (without a move event the monitor observed), or the Reveal
+                // panel may have opened, since the countdown was armed.
                 guard self.autoCollapseEnabled, !self.isCollapsed,
-                      !self.pointerInMenuBar() else { return }
+                      !self.pointerInMenuBar(), !self.revealPanelOpen else { return }
                 MTDebug.log("auto-collapse: firing collapse")
                 self.collapse()
             }
@@ -352,6 +364,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func collapse() {
         isCollapsed = true
         stopAutoCollapseTracking()
+        // Collapsing hides the very icons a Reveal panel is listing, so dismiss
+        // it. Auto-collapse never fires while the panel is open (see
+        // evaluateAutoCollapse), so in practice this only runs on a manual
+        // collapse — clicking the chevron while Reveal is up.
+        revealPanel?.close()
+        revealPanel = nil
         spacerItem.length = 10_000
         updateIcon()
 
@@ -401,6 +419,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: Menu
 
     func showMenu() {
+        // Snapshot the panel's open state *before* performClick opens the menu
+        // (which dismisses the panel), so revealHiddenIcons() can toggle it off.
+        revealPanelWasOpenAtMenuInvoke = (revealPanel?.isVisible == true)
         let menu = buildMenu()
         chevronItem.menu = menu
         chevronItem.button?.performClick(nil)
@@ -429,7 +450,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func revealHiddenIcons() {
-        if revealPanel?.isVisible == true {
+        // Toggle: if the panel was open when this menu was invoked, close it and
+        // stop. Decided from the pre-menu snapshot, not the live panel, because
+        // opening the menu already dismissed it.
+        let wasOpen = revealPanelWasOpenAtMenuInvoke
+        revealPanelWasOpenAtMenuInvoke = false
+        if wasOpen {
             revealPanel?.close()
             revealPanel = nil
             return
@@ -443,31 +469,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             _ = AXIsProcessTrustedWithOptions(opts)
         }
 
-        // Show the cached snapshot for an instant open, but kick off a fresh
-        // detect immediately and update the panel's content in place when it
-        // completes. Covers the case where the cache was populated during
-        // initial menu bar reflow (and so missed icons that drifted into the
-        // notch a moment later) without making the user wait.
-        var items = HiddenIcons.cached
-        if items.isEmpty && axGranted {
-            items = HiddenIcons.detectClipped()
-        }
-
-        let panel = HiddenIconsPanel(items: items, axGranted: axGranted)
+        // Open in a loading state and scan fresh — never show the cached
+        // snapshot, which the user can't distinguish from the final list. The
+        // spinner is replaced by the real list once the background walk
+        // completes. Always a *full* walk: an app that launched after the last
+        // enumeration wouldn't be in the fast-path host-PID cache.
+        let panel = HiddenIconsPanel(axGranted: axGranted)
         panel.anchor(to: chevronItem)
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         revealPanel = panel
 
-        // Live-update the panel with the post-refresh list. Use a *full*
-        // walk here, not the fast cached one: an app that launched after
-        // the last full enumeration (or that slow-started past the 1.5 s
-        // post-launch refresh window) won't be in the host-PID cache, so
-        // a fast walk would never see it. The full walk takes ~1.6 s but
-        // runs in the background and updates the panel in place when it
-        // completes — the user sees the cached snapshot first and the
-        // refreshed list a moment later.
+        MTDebug.log("reveal open: axGranted=\(axGranted) (scanning)")
+        guard axGranted else { return }   // no scan without AX; panel shows the permission message
         HiddenIcons.refreshAsyncFull { [weak panel] fresh in
+            MTDebug.log("reveal refresh done: fresh=\(fresh.count) panelVisible=\(panel?.isVisible == true)")
             guard let panel, panel.isVisible else { return }
             panel.updateItems(fresh)
         }
@@ -491,8 +507,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         var actions: [JorvikMenuBuilder.ActionItem] = [tip]
 
-        // Only offer the reveal action on notched displays — pointless otherwise.
-        if HiddenIcons.notchHorizontalRange() != nil {
+        // Only offer the reveal action on notched displays, and only while the
+        // bar is expanded — when collapsed, every third-party icon is shoved
+        // off-screen to the spacer sentinel (~-4400), so there's nothing
+        // meaningful to reveal or activate.
+        if HiddenIcons.notchHorizontalRange() != nil && !isCollapsed {
             actions.append(.init(title: "-", action: #selector(NSObject.description), target: self))
             actions.append(.init(
                 title: "Reveal Hidden Icons\u{2026}",
@@ -891,18 +910,21 @@ enum HiddenIcons {
 /// item so the user can use icons that are clipped behind the notch.
 final class HiddenIconsPanel: NSPanel {
 
-    private var items: [HiddenIcon]
+    private var items: [HiddenIcon] = []
     private let axGranted: Bool
+    // While true the panel shows a spinner instead of a list. We never show the
+    // cached snapshot — the user can't tell a provisional list from the final
+    // one — so the panel opens "scanning" and swaps to the real list when the
+    // background walk finishes (updateItems).
+    private var isLoading: Bool
 
-    init(items: [HiddenIcon], axGranted: Bool) {
-        self.items = items
+    init(axGranted: Bool) {
         self.axGranted = axGranted
-        let rowH: CGFloat = 32
-        let pad: CGFloat = 8
-        let headerH: CGFloat = items.isEmpty ? 0 : 22
-        let footerH: CGFloat = 22
-        let height = pad * 2 + headerH + CGFloat(items.count) * rowH + footerH
-        let frame = NSRect(x: 0, y: 0, width: 320, height: max(height, 80))
+        // A spinner only makes sense when we're actually about to scan; without
+        // Accessibility there's nothing to scan, so open straight to the
+        // permission message instead.
+        self.isLoading = axGranted
+        let frame = NSRect(x: 0, y: 0, width: 320, height: 80)
         super.init(
             contentRect: frame,
             styleMask: [.borderless, .nonactivatingPanel],
@@ -916,7 +938,16 @@ final class HiddenIconsPanel: NSPanel {
         self.hasShadow = true
         self.hidesOnDeactivate = false
         self.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
-        buildContent(rowHeight: rowH, padding: pad, headerHeight: headerH, footerHeight: footerH)
+        rebuildContent()
+    }
+
+    /// Panel height for the current state: a fixed compact box while loading (or
+    /// empty), otherwise sized to the row count.
+    private func preferredHeight() -> CGFloat {
+        if isLoading { return 80 }
+        let pad: CGFloat = 8, rowH: CGFloat = 32, footerH: CGFloat = 22
+        let headerH: CGFloat = items.isEmpty ? 0 : 22
+        return max(pad * 2 + headerH + CGFloat(items.count) * rowH + footerH, 80)
     }
 
     func anchor(to statusItem: NSStatusItem) {
@@ -927,30 +958,27 @@ final class HiddenIconsPanel: NSPanel {
         setFrameOrigin(NSPoint(x: originX, y: originY))
     }
 
-    /// Replace the panel's content with a fresh list. Called by the
-    /// live-update path after a background refresh discovers items that
-    /// the cache snapshot at open time didn't have.
+    /// Swap in the freshly-scanned list, replacing the spinner (or a previous
+    /// list). The first call out of the loading state always rebuilds — even to
+    /// an empty list — so the spinner is guaranteed to be replaced; later
+    /// refreshes no-op when the list is unchanged, to avoid flicker.
     func updateItems(_ newItems: [HiddenIcon]) {
-        // No-op if identical — avoids needless rebuild flicker.
-        let oldKeys = items.map { "\($0.appName)|\(Int($0.frame.minX))" }
-        let newKeys = newItems.map { "\($0.appName)|\(Int($0.frame.minX))" }
-        guard oldKeys != newKeys else { return }
+        if !isLoading {
+            let oldKeys = items.map { "\($0.appName)|\(Int($0.frame.minX))" }
+            let newKeys = newItems.map { "\($0.appName)|\(Int($0.frame.minX))" }
+            guard oldKeys != newKeys else { return }
+        }
+        isLoading = false
         items = newItems
 
-        // Resize to fit and rebuild content. setFrame with display:true
-        // resizes contentView synchronously so buildContent's NSVisualEffectView
-        // gets the right bounds.
-        let rowH: CGFloat = 32
-        let pad: CGFloat = 8
-        let headerH: CGFloat = items.isEmpty ? 0 : 22
-        let footerH: CGFloat = 22
-        let height = pad * 2 + headerH + CGFloat(items.count) * rowH + footerH
+        // Resize to fit and rebuild. setFrame(display:true) resizes contentView
+        // synchronously so rebuildContent's NSVisualEffectView gets right bounds.
         var f = frame
         let oldHeight = f.height
-        f.size.height = max(height, 80)
+        f.size.height = preferredHeight()
         f.origin.y += oldHeight - f.size.height  // keep top edge anchored
         setFrame(f, display: true)
-        buildContent(rowHeight: rowH, padding: pad, headerHeight: headerH, footerHeight: footerH)
+        rebuildContent()
     }
 
     override var canBecomeKey: Bool { true }
@@ -963,7 +991,12 @@ final class HiddenIconsPanel: NSPanel {
         }
     }
 
-    private func buildContent(rowHeight: CGFloat, padding: CGFloat, headerHeight: CGFloat, footerHeight: CGFloat) {
+    private func rebuildContent() {
+        let pad: CGFloat = 8
+        let rowH: CGFloat = 32
+        let headerH: CGFloat = 22
+        let footerH: CGFloat = 22
+
         let content = NSVisualEffectView(frame: contentView!.bounds)
         content.autoresizingMask = [.width, .height]
         content.material = .menu
@@ -975,7 +1008,26 @@ final class HiddenIconsPanel: NSPanel {
         contentView = content
 
         let bounds = content.bounds
-        var y = bounds.height - padding
+
+        // Loading: a centred spinner over a single "scanning" line, nothing else.
+        if isLoading {
+            let spin: CGFloat = 18
+            let spinner = NSProgressIndicator(frame: NSRect(
+                x: (bounds.width - spin) / 2, y: bounds.midY + 2, width: spin, height: spin))
+            spinner.style = .spinning
+            spinner.controlSize = .small
+            spinner.isIndeterminate = true
+            spinner.startAnimation(nil)
+            content.addSubview(spinner)
+
+            let label = makeLabel("Scanning the menu bar\u{2026}", size: 11, colour: .secondaryLabelColor)
+            label.alignment = .center
+            label.frame = NSRect(x: pad, y: bounds.midY - 22, width: bounds.width - pad * 2, height: 16)
+            content.addSubview(label)
+            return
+        }
+
+        var y = bounds.height - pad
 
         if !items.isEmpty {
             let headerLabel = makeLabel(
@@ -983,15 +1035,15 @@ final class HiddenIconsPanel: NSPanel {
                 size: 11,
                 colour: .secondaryLabelColor
             )
-            headerLabel.frame = NSRect(x: padding, y: y - headerHeight, width: bounds.width - padding * 2, height: headerHeight)
+            headerLabel.frame = NSRect(x: pad, y: y - headerH, width: bounds.width - pad * 2, height: headerH)
             content.addSubview(headerLabel)
-            y -= headerHeight
+            y -= headerH
         }
 
         for item in items {
-            y -= rowHeight
+            y -= rowH
             let row = HiddenIconRow(item: item, panel: self)
-            row.frame = NSRect(x: padding, y: y, width: bounds.width - padding * 2, height: rowHeight)
+            row.frame = NSRect(x: pad, y: y, width: bounds.width - pad * 2, height: rowH)
             content.addSubview(row)
         }
 
@@ -1005,7 +1057,7 @@ final class HiddenIconsPanel: NSPanel {
         }
         let footer = makeLabel(footerText, size: 11, colour: .secondaryLabelColor)
         footer.alignment = .center
-        footer.frame = NSRect(x: padding, y: padding, width: bounds.width - padding * 2, height: footerHeight)
+        footer.frame = NSRect(x: pad, y: pad, width: bounds.width - pad * 2, height: footerH)
         content.addSubview(footer)
     }
 
@@ -1062,12 +1114,28 @@ extension HiddenIcons {
         CGWarpMouseCursorPosition(iconPoint)
 
         if button == .left {
-            // AXPress reliably opens the menu (or fires the primary action) on
-            // every NSStatusItem regardless of hit-test geometry. Best path
-            // for left-click on hidden items.
-            AXUIElementPerformAction(item.axElement, kAXPressAction as CFString)
+            // AXPress bypasses hit-testing, so it's the reliable path for a
+            // behind-notch item. But on macOS 26 (Tahoe) the *first* press to
+            // another app's menu-bar extra often returns kAXErrorCannotComplete
+            // — the AX messaging channel to that app is cold — and the click
+            // silently does nothing (issue #3). Bound each attempt with a short
+            // timeout and retry until the channel warms (usually the 2nd try).
+            AXUIElementSetMessagingTimeout(item.axElement, 1.0)
+            var errs: [Int32] = []
+            var err = AXUIElementPerformAction(item.axElement, kAXPressAction as CFString)
+            errs.append(err.rawValue)
+            var tries = 1
+            while err == .cannotComplete && tries < 4 {
+                usleep(120_000)   // 120 ms breather between tries
+                err = AXUIElementPerformAction(item.axElement, kAXPressAction as CFString)
+                errs.append(err.rawValue)
+                tries += 1
+            }
+            MTDebug.log("send left '\(item.appName)' AXPress=\(errs)")
             return
         }
+
+        MTDebug.log("send right '\(item.appName)'")
 
         // Right-click — apps that distinguish use a separate right-click handler.
         // AX has no standard "right-press" action, so synthesise it via CGEvent.
