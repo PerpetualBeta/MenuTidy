@@ -1059,6 +1059,13 @@ final class HiddenIconsPanel: NSPanel {
         footer.alignment = .center
         footer.frame = NSRect(x: pad, y: pad, width: bounds.width - pad * 2, height: footerH)
         content.addSubview(footer)
+
+        // The window drop-shadow is cached from the rectangular backing and is NOT
+        // recomputed when the rounded content or the panel size changes — so it drew
+        // SQUARE corners behind the rounded panel. Invalidate it once this layout has
+        // rendered (so the rounded, transparent-cornered content is on screen) and
+        // AppKit re-derives the shadow to hug the rounded shape.
+        DispatchQueue.main.async { [weak self] in self?.invalidateShadow() }
     }
 
     private func makeLabel(_ text: String, size: CGFloat, colour: NSColor) -> NSTextField {
