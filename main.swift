@@ -479,6 +479,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         revealPanel = panel
+        // Dismissing the panel (esp. click-away) must re-arm auto-collapse: closing it
+        // isn't a mouse-move, so the tracking monitor never re-evaluates on its own and
+        // the bar would stay expanded forever. Re-evaluate on close (a no-op during a
+        // controller-driven collapse, which has already set isCollapsed + stopped tracking).
+        panel.onDismiss = { [weak self] in self?.evaluateAutoCollapse() }
 
         MTDebug.log("reveal open: axGranted=\(axGranted) (scanning)")
         guard axGranted else { return }   // no scan without AX; panel shows the permission message
@@ -918,6 +923,12 @@ final class HiddenIconsPanel: NSPanel {
     // background walk finishes (updateItems).
     private var isLoading: Bool
 
+    /// Called after the panel dismisses (any path: click-away, Esc, activate, or a
+    /// controller-driven close). Lets the controller re-evaluate auto-collapse — a
+    /// click that closes the panel is not a mouse-move, so the controller's
+    /// mouseMoved tracking would never otherwise re-fire to arm the countdown.
+    var onDismiss: (() -> Void)?
+
     init(axGranted: Bool) {
         self.axGranted = axGranted
         // A spinner only makes sense when we're actually about to scan; without
@@ -989,6 +1000,15 @@ final class HiddenIconsPanel: NSPanel {
         DispatchQueue.main.async { [weak self] in
             self?.close()
         }
+    }
+
+    // Notify the controller on EVERY dismissal (click-away, Esc, activate, or a
+    // controller-driven close) so it can re-arm auto-collapse without waiting for a
+    // mouse-move that may never come. `super.close()` orders the window out first,
+    // so `isVisible` is already false when the controller re-evaluates.
+    override func close() {
+        super.close()
+        onDismiss?()
     }
 
     private func rebuildContent() {
