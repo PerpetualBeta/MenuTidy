@@ -1003,8 +1003,15 @@ final class HiddenIconsPanel: NSPanel {
         content.blendingMode = .behindWindow
         content.state = .active
         content.wantsLayer = true
-        content.layer?.cornerRadius = 10
+        let cornerR: CGFloat = 10
+        content.layer?.cornerRadius = cornerR
         content.layer?.masksToBounds = true
+        // The layer cornerRadius rounds the view's PIXELS, but the window's drop-shadow
+        // reads the rectangular backing — so it drew square corners behind the rounded
+        // panel (invalidateShadow just recomputes the same square). A resizable rounded
+        // maskImage is the one thing the window-shadow machinery honours, so the shadow
+        // follows the rounding.
+        content.maskImage = Self.roundedMask(radius: cornerR)
         contentView = content
 
         let bounds = content.bounds
@@ -1074,6 +1081,23 @@ final class HiddenIconsPanel: NSPanel {
         f.textColor = colour
         f.lineBreakMode = .byTruncatingTail
         return f
+    }
+
+    /// A resizable rounded-rect mask for the panel's NSVisualEffectView. Using this as
+    /// the view's `maskImage` (not just a layer cornerRadius) is what makes the WINDOW's
+    /// drop-shadow hug the rounded corners: the shadow follows the vibrancy view's
+    /// reported mask, whereas a layer cornerRadius leaves the window shadow square. The
+    /// cap-insets keep the corners crisp while the straight edges stretch to any size.
+    private static func roundedMask(radius r: CGFloat) -> NSImage {
+        let d = r * 2 + 1
+        let img = NSImage(size: NSSize(width: d, height: d), flipped: false) { rect in
+            NSColor.black.setFill()
+            NSBezierPath(roundedRect: rect, xRadius: r, yRadius: r).fill()
+            return true
+        }
+        img.capInsets = NSEdgeInsets(top: r, left: r, bottom: r, right: r)
+        img.resizingMode = .stretch
+        return img
     }
 
     override func keyDown(with event: NSEvent) {
