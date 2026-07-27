@@ -77,6 +77,7 @@ The menu item only appears on notched displays. The first time you use it MenuTi
 
 ### Settings…
 
+- **Auto-collapse** — automatically collapse the bar a few seconds after the pointer leaves it (0–999 seconds; 0 = immediately). Off by default; see below
 - **Permissions → Accessibility** — required for **Reveal Hidden Icons**; shows live status with a Grant Access button if not yet granted
 - **Menu bar icon pill** — optional grey background for stronger contrast on busy or wallpaper-tinted menu bars (off by default)
 - **General → Launch at Login** — start MenuTidy automatically when you log in
@@ -89,25 +90,12 @@ Auto-updates are handled by Sparkle. Use the **Check for Updates…** menu item 
 - Other apps' icon positions are preserved by macOS in their own preferences, so the layout you build once stays put
 - On subsequent launches, MenuTidy automatically collapses after a short delay to let all icons load into their saved positions first
 
-## Auto-collapse (advanced)
+## Auto-collapse
 
-By default the bar stays in whatever state you left it — expand to peek at your icons, and it waits for you to click again to tidy. If you'd rather it re-tidy itself, MenuTidy can auto-collapse a couple of seconds after the pointer leaves the menu bar. It's off by default; enable it per-machine with:
+By default the bar stays in whatever state you left it — expand to peek at your icons, and it waits for you to click again to tidy. If you'd rather it re-tidy itself, turn on **Auto-collapse** in Settings (right-click the chevron → **Settings…**):
 
-```bash
-defaults write cc.jorviksoftware.MenuTidy autoCollapse -bool YES
-```
-
-The delay is two seconds by default. To change it, set a value in seconds:
-
-```bash
-defaults write cc.jorviksoftware.MenuTidy autoCollapseDelay -int 3
-```
-
-Both are read at launch, so quit and relaunch MenuTidy for a change to take effect. To turn it back off:
-
-```bash
-defaults write cc.jorviksoftware.MenuTidy autoCollapse -bool NO
-```
+- **Automatically collapse the menu bar** — the on/off switch (off by default).
+- **Collapse after … seconds** — how long to wait after the pointer leaves the menu bar before tidying, from 0 to 999. Set it to **0** to collapse the moment you move away.
 
 The countdown starts when the pointer leaves the menu bar and is cancelled if you move back up to it before it elapses — so the bar only tidies once you've genuinely moved away.
 

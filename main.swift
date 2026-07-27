@@ -53,14 +53,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // panel whether it was open — we decide the toggle from this snapshot.
     var revealPanelWasOpenAtMenuInvoke = false
 
-    // Auto-collapse (opt-in). When enabled, the bar tidies itself a short delay
-    // after the pointer leaves the menu-bar vicinity, so an expand-to-peek
-    // doesn't leave the bar open indefinitely. Config is read once at launch
-    // (see applicationDidFinishLaunching), matching the debugLogging flag.
+    // Auto-collapse. When on, the bar tidies itself a short delay after the
+    // pointer leaves the menu-bar vicinity. A first-class setting (Settings →
+    // Auto-Collapse) backed by the `autoCollapse` / `autoCollapseDelay`
+    // UserDefaults keys, cached into these ivars so the pointer-tracking hot
+    // path stays lookup-free; re-read live via autoCollapseSettingsChanged().
     var autoCollapseMouseMonitor: Any?
     var autoCollapsePending: DispatchWorkItem?
     private var autoCollapseEnabled = false
-    private var autoCollapseDelay: TimeInterval = 2   // "a couple of seconds"
+    private var autoCollapseDelay: TimeInterval = 2   // seconds; 0 = collapse immediately
+    private static let maxAutoCollapseDelay: TimeInterval = 999
 
     var isCollapsed = false
     private let hasLaunchedBeforeKey = "MenuTidy_HasLaunchedBefore"
@@ -76,15 +78,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         migrateLegacyPillColorKey()
 
-        // Auto-collapse config (opt-in, off by default). Enable per-machine:
-        //   defaults write cc.jorviksoftware.MenuTidy autoCollapse -bool YES
-        // Optionally tune the delay in seconds (default 2):
-        //   defaults write cc.jorviksoftware.MenuTidy autoCollapseDelay -int 3
-        // Read once here so the pointer-tracking hot path stays free of
-        // UserDefaults lookups; a change takes effect on the next launch.
-        autoCollapseEnabled = UserDefaults.standard.bool(forKey: "autoCollapse")
-        let configuredDelay = UserDefaults.standard.double(forKey: "autoCollapseDelay")
-        if configuredDelay > 0 { autoCollapseDelay = configuredDelay }
+        // Auto-collapse config — a first-class setting (Settings → Auto-Collapse),
+        // off by default. Cached here; re-read live when the user changes it.
+        reloadAutoCollapseConfig()
 
         setupStatusItems()
         setupCmdKeyMonitor()
@@ -297,6 +293,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // pointer is below the band the whole time. Rare in practice, and the
     // affected item reappears on the next expand.
 
+    /// Read the auto-collapse setting into the cached ivars. `autoCollapse`
+    /// absent → off; `autoCollapseDelay` absent → 2 s, otherwise clamped to
+    /// 0…999 (0 = collapse the moment the pointer leaves). Read-only — safe to
+    /// call before the status items exist (e.g. at launch).
+    func reloadAutoCollapseConfig() {
+        let d = UserDefaults.standard
+        autoCollapseEnabled = d.bool(forKey: "autoCollapse")
+        let secs = d.object(forKey: "autoCollapseDelay") == nil ? 2.0 : d.double(forKey: "autoCollapseDelay")
+        autoCollapseDelay = min(Self.maxAutoCollapseDelay, max(0, secs))
+    }
+
+    /// Called when the user changes the setting in Settings: re-read and apply
+    /// immediately, no relaunch. Start tracking if it's now on and the bar is
+    /// expanded; tear it down if it's now off.
+    func autoCollapseSettingsChanged() {
+        reloadAutoCollapseConfig()
+        if autoCollapseEnabled {
+            if !isCollapsed { startAutoCollapseTracking() }
+        } else {
+            stopAutoCollapseTracking()
+        }
+    }
+
     /// Begin watching the pointer so we can auto-collapse once it leaves the
     /// menu-bar vicinity. Called whenever the bar expands. Idempotent, and a
     /// no-op unless the feature is enabled.
@@ -445,7 +464,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func openSettings() {
         JorvikSettingsView.showWindow(appName: "MenuTidy") { [weak self] in
-            MenuTidySettingsContent { self?.updateIcon() }
+            MenuTidySettingsContent(
+                onPillChanged: { self?.updateIcon() },
+                onAutoCollapseChanged: { self?.autoCollapseSettingsChanged() }
+            )
         }
     }
 
