@@ -75,6 +75,18 @@ Each time you open the panel it scans the menu bar fresh — a brief spinner sho
 
 The menu item only appears on notched displays. The first time you use it MenuTidy will ask for Accessibility permission so it can enumerate other apps' status items; you can also grant it ahead of time from **Settings → Permissions**.
 
+#### Where the notch actually ends
+
+macOS reports the notch's right edge through `auxiliaryTopRightArea`, but it does not start drawing status items there — there is a dead band of roughly 14 to 30 points beyond it where an item is laid out, reports a perfectly ordinary position, and is never rendered. Nothing in AppKit describes that band, and a probe status item doesn't find it either (it measures the leftmost *available slot* for the current arrangement, which is a different thing).
+
+An icon parked in that band used to be reported as visible while being nowhere on screen, so it was left out of the very panel meant to reveal it. MenuTidy now allows for it. If your Mac's band differs, the clearance is a knob:
+
+```
+defaults write cc.jorviksoftware.MenuTidy notchDrawInset -float 24
+```
+
+Default is 22. **Err low if you change it** — too small only reverts to missing the odd icon from the list, while too large starts hiding icons that are plainly on screen.
+
 ### Settings…
 
 - **Auto-collapse** — automatically collapse the bar a few seconds after the pointer leaves it (0–999 seconds; 0 = immediately). Off by default; see below

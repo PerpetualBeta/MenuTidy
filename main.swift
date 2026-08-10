@@ -748,6 +748,33 @@ enum HiddenIcons {
     /// Returns the X range occupied by the notch on the main screen, or nil if
     /// the screen has no notch. Used both to gate the reveal feature and to
     /// classify which status items are clipped.
+    /// Extra clearance beyond the *reported* notch edge before macOS will actually draw a status item.
+    ///
+    /// `auxiliaryTopRightArea.minX` is not the draw boundary. Established from two observations, each
+    /// pairing a logged layout with what was genuinely on screen at that moment:
+    ///
+    ///   a) Rainy Day at 862 invisible, HyperCaps at 895 the leftmost visible → boundary ∈ (862, 895]
+    ///   b) Rainy Day at 845 invisible, HyperCaps at 878 the leftmost visible → boundary ∈ (845, 878]
+    ///
+    /// Intersecting those gives a boundary in **(862, 878]** on a display reporting its notch edge at
+    /// 848 — an inset of 14 to 30 points. The reported edge, 848, satisfies neither observation, which
+    /// is why an icon sitting in that band was reported visible while being nowhere on screen.
+    ///
+    /// This is a *measured* constant, not a derived one: nothing in AppKit reports it, and a probe
+    /// status item measures the leftmost available slot given current packing, which is a different
+    /// quantity (it read 896 — above the bracket — and would have hidden HyperCaps). So it is exposed
+    /// rather than buried, defaulted to the middle of the bracket:
+    ///
+    ///     defaults write cc.jorviksoftware.MenuTidy notchDrawInset -float 22
+    ///
+    /// **Err low if it ever needs adjusting.** Too small merely restores the old under-detection, which
+    /// omits an icon from the panel. Too large hides icons that are genuinely on screen — the worse
+    /// failure, and one this code shipped briefly while I had it at 1014.
+    static var notchDrawInset: CGFloat {
+        guard let override = UserDefaults.standard.object(forKey: "notchDrawInset") as? Double else { return 22 }
+        return CGFloat(override)
+    }
+
     static func notchHorizontalRange() -> ClosedRange<CGFloat>? {
         guard let screen = NSScreen.main else { return nil }
         guard screen.safeAreaInsets.top > 0 else { return nil }
@@ -792,7 +819,10 @@ enum HiddenIcons {
         // must lie within it. `screenMaxX` guards the (rare) off-the-right case.
         let screenMaxX = NSScreen.main?.frame.maxX ?? .greatestFiniteMagnitude
 
-        MTDebug.log("--- walk (\(isFullWalk ? "full" : "fast")) notch=\(notchRange.lowerBound)...\(notchRange.upperBound) screenMaxX=\(screenMaxX) ---")
+        // The boundary macOS actually draws from — the reported notch edge plus the measured inset.
+        let drawBoundary = notchRange.upperBound + notchDrawInset
+
+        MTDebug.log("--- walk (\(isFullWalk ? "full" : "fast")) notch=\(notchRange.lowerBound)...\(notchRange.upperBound) inset=\(notchDrawInset) drawBoundary=\(drawBoundary) screenMaxX=\(screenMaxX) ---")
 
         let lock = NSLock()
         var result: [HiddenIcon] = []
@@ -856,7 +886,7 @@ enum HiddenIcons {
                 //     them as visible, which is why exposing dropped icons like
                 //     AdGuard Mini / RainbowApple / MirrorGuard from the panel),
                 //   - flung off-screen-left to the spacer's ~-4000 sentinel.
-                let visibleRightOfNotch = frame.minX >= notchRange.upperBound && frame.minX < screenMaxX
+                let visibleRightOfNotch = frame.minX >= drawBoundary && frame.minX < screenMaxX
                 // Unplaced sentinel: some apps register a status item they
                 // aren't actually showing; AX parks it at the screen's far-left
                 // origin (x≈-1…7, so a tiny positive maxX). No real status
