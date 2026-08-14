@@ -16,6 +16,10 @@ struct MenuTidySettingsContent: View {
     var onPillChanged: () -> Void
     var onAutoCollapseChanged: () -> Void
 
+    /// Kept current by JorvikKit — see `JorvikPermissionWatcher` for why a permission row
+    /// needs a watcher rather than a read, and why reading it more often makes it worse.
+    @StateObject private var accessibility = JorvikPermissionWatcher.accessibility()
+
     var body: some View {
         MenuTidyAutoCollapseSettings(onChanged: onAutoCollapseChanged)
 
@@ -23,14 +27,13 @@ struct MenuTidySettingsContent: View {
             HStack {
                 Text("Accessibility")
                 Spacer()
-                if AXIsProcessTrusted() {
+                if accessibility.isGranted {
                     Label("Granted", systemImage: "checkmark.circle.fill")
                         .foregroundStyle(.green)
                         .font(.caption)
                 } else {
                     Button("Grant Access") {
-                        let opts = [kAXTrustedCheckOptionPrompt.takeRetainedValue(): true] as CFDictionary
-                        AXIsProcessTrustedWithOptions(opts)
+                        JorvikPermissionWatcher.promptForAccessibility()
                     }
                     .font(.caption)
                 }
