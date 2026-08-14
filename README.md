@@ -121,7 +121,7 @@ The countdown starts when the pointer leaves the menu bar and is cancelled if yo
 
 MenuTidy is a single-file Swift app with no dependencies beyond macOS system frameworks. No Xcode project is required.
 
-The build is driven by the shared [`release.mk`](https://github.com/PerpetualBeta/jorvik-release) Make include, so `jorvik-release` has to be checked out **beside this repo** — the Makefile looks for it at `../jorvik-release/`. macOS ships GNU Make 3.81 as `make`, which is too old, so `gmake` comes from Homebrew.
+The build is driven by the shared [`release.mk`](https://github.com/PerpetualBeta/jorvik-release) Make include, so `jorvik-release` has to be checked out **beside this repo** — the Makefile looks for it at `../jorvik-release/`. macOS ships GNU Make 3.81 as `make`, which is too old, so `gmake` comes from [Homebrew](https://brew.sh).
 
 ```bash
 brew install make   # GNU Make 4+, if you do not already have gmake
