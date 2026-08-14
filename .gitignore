@@ -23,3 +23,6 @@ DerivedData/
 # Temp
 *.swp
 *.swo
+
+# Claude Code session scratch (worktrees, local state)
+.claude/
