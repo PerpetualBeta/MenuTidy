@@ -43,14 +43,14 @@ All icons to the **left** of the spacer will be hidden when collapsed. All icons
 
 To move an icon between the hidden and visible zones:
 
-1. Hold **⌘** (Command) — a glowing blue bar will appear in your menu bar showing where the spacer is
-2. While holding **⌘**, drag any menu bar icon to the **right** of the blue bar to keep it always visible
+1. Hold `command` (Command) — a glowing blue bar will appear in your menu bar showing where the spacer is
+2. While holding `command`, drag any menu bar icon to the **right** of the blue bar to keep it always visible
 3. Drag icons to the **left** of the blue bar to include them in the collapsible group
-4. Release **⌘** — the blue bar disappears
+4. Release `command` — the blue bar disappears
 
 ### Repositioning the spacer
 
-You can also move the spacer itself. Hold **⌘** and drag the glowing blue bar left or right to change where the hidden/visible boundary sits.
+You can also move the spacer itself. Hold `command` and drag the glowing blue bar left or right to change where the hidden/visible boundary sits.
 
 ## Day-to-Day Use
 
@@ -58,8 +58,8 @@ You can also move the spacer itself. Hold **⌘** and drag the glowing blue bar 
 |---|---|
 | Left-click chevron | Toggle collapse/expand |
 | Right-click chevron | Open settings menu |
-| Hold ⌘ | Reveal the spacer position (blue bar) |
-| ⌘+drag an icon | Move it between hidden/visible zones |
+| Hold `command` | Reveal the spacer position (blue bar) |
+| `command`+drag an icon | Move it between hidden/visible zones |
 
 ## Right-click Menu
 
@@ -129,7 +129,7 @@ git clone https://github.com/PerpetualBeta/jorvik-release.git
 git clone https://github.com/PerpetualBeta/MenuTidy.git
 cd MenuTidy
 gmake build
-open .build/MenuTidy.app
+open.build/MenuTidy.app
 ```
 
 ## Troubleshooting
@@ -148,11 +148,11 @@ Then relaunch the app.
 
 ### Icons aren't hiding
 
-Make sure the icons you want hidden are to the **left** of the spacer (the glowing blue bar that appears when you hold ⌘). Icons to the right of the spacer are excluded from hiding.
+Make sure the icons you want hidden are to the **left** of the spacer (the glowing blue bar that appears when you hold `command`). Icons to the right of the spacer are excluded from hiding.
 
 ### The spacer isn't visible
 
-The spacer is only visible when you hold the **⌘** key. In normal use it's completely invisible.
+The spacer is only visible when you hold the `command` key. In normal use it's completely invisible.
 
 ---
 
