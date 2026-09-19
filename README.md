@@ -1,10 +1,32 @@
 # MenuTidy
 
+> ## Does not work on macOS 27
+>
+> **macOS 27 changed how the menu bar works and what the system exposes to
+> apps.** MenuTidy hides icons by placing an invisible spacer in the menu bar
+> and expanding it to push icons out of sight. On macOS 27 that has no effect.
+> The icons stay visible.
+>
+> **There is no workaround yet.** Nothing in Apple's documentation or in the
+> public domain offers a route back, and MenuTidy in its current form cannot do
+> what it was built to do. The investigation is still open rather than
+> abandoned; progress is tracked in
+> [issue #4](https://github.com/PerpetualBeta/MenuTidy/issues/4).
+>
+> macOS 27 does have a menu bar hider of its own, but it works differently and
+> does not offer the same functionality, so it is not a replacement for what
+> MenuTidy did.
+>
+> **On macOS 14 through 26 nothing has changed.** MenuTidy works exactly as it
+> always did, the app is still signed and notarised, and the update feed stays
+> up. If you are on one of those versions this notice does not affect you.
+
 A lightweight macOS menu bar manager that keeps your menu bar clean by collapsing third-party icons out of sight. Click to expand and reveal them when needed.
 
 ## Requirements
 
-- macOS 14 (Sonoma) or later
+- macOS 14 (Sonoma) through macOS 26 (Tahoe)
+- **Not macOS 27** — see the notice above
 
 ## Installation
 
