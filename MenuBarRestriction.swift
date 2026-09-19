@@ -107,9 +107,35 @@ enum MenuBarRestriction {
     /// dropped; releasing it is what puts the icons back.
     private static var assertion: AnyObject?
 
+    /// Apple's own menu bar owners, always kept whatever the user's layout.
+    ///
+    /// `allowedSystemItems` keeps the clock and Control Centre *drawn*, but that
+    /// is not the same as keeping them usable: if the app that owns them is
+    /// missing from `allowedBundleIdentifiers`, the clock is visible and
+    /// **clicking it does nothing**, so Notification Centre cannot be opened.
+    /// Measured on 2026-09-19 — the same fault reported against Hidden Bar as
+    /// issue #421.
+    ///
+    /// It was also intermittent, which is worse than broken: these items sit far
+    /// right, so whether they landed in the snapshot depended on where the
+    /// chevron happened to be and how the displays were arranged. Some collapses
+    /// included MenuBarAgent and some did not.
+    ///
+    /// Hiding the clock or Control Centre is never what anyone wants from a menu
+    /// bar tidier, so it is decided here rather than left to the layout.
+    private static let alwaysAllowedBundleIdentifiers = [
+        "com.apple.MenuBarAgent",     // the clock, and Notification Centre with it
+        "com.apple.controlcenter",
+        "com.apple.systemuiserver",
+    ]
+
     /// Every raw value the system-item enum might use. Passing a range rather
     /// than specific cases is deliberate — see the note above on why the real
     /// case names cannot be read. Values macOS does not recognise are ignored.
+    /// 0 to 63 is verified to keep the clock and Control Centre drawn. Widening
+    /// it to 255 was tried on 2026-09-19 to see whether an identifier above the
+    /// range explained Notification Centre being unreachable while collapsed. It
+    /// did not, so the narrower verified range stands.
     private static let allSystemItemIdentifiers: [NSNumber] = (0..<64).map(NSNumber.init(value:))
 
     // MARK: - Applying
@@ -124,6 +150,10 @@ enum MenuBarRestriction {
     /// - Returns: whether the restriction was applied.
     @discardableResult
     static func restrict(toVisible bundleIdentifiers: [String]) -> Bool {
+        var bundleIdentifiers = bundleIdentifiers
+        for identifier in alwaysAllowedBundleIdentifiers where !bundleIdentifiers.contains(identifier) {
+            bundleIdentifiers.append(identifier)
+        }
         guard isAvailable,
               let configurationClass,
               let assertionClass,

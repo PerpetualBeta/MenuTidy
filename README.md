@@ -19,6 +19,9 @@
 > - **Reveal Hidden Icons is gone, because macOS 27 does it.** The system grew
 >   its own control for reaching icons tucked behind the notch, which is what
 >   that feature existed for.
+> - **Notification Centre cannot be opened from the clock while collapsed.**
+>   Two-finger swipe in from the right edge of the trackpad instead, or expand
+>   MenuTidy first. See below for why.
 >
 > **On macOS 14 through 26 nothing has changed at all** — same spacer, same
 > behaviour, same Reveal Hidden Icons.
@@ -108,6 +111,17 @@ Right-click the chevron for the standard Jorvik menu:
 - **Check for Updates…** — runs a Sparkle-powered update check
 - **Settings…**
 - **Quit MenuTidy** — exit the app (all hidden icons reappear)
+
+## Notification Centre while collapsed (macOS 27)
+
+While the bar is collapsed, **clicking the clock does not open Notification Centre**. Two ways round it:
+
+- **Two-finger swipe in from the right edge of the trackpad.** This works normally while collapsed.
+- **Expand MenuTidy first**, then click the clock as usual.
+
+This is a limit of the mechanism rather than a bug that can be fixed. macOS 27 hides menu bar items through a facility built for exam lockdown, and suppressing access to notifications is one of the things that facility is *for*. It takes a list of what to keep, and no entry in that list re-enables Notification Centre — tested both by naming the apps that own the clock and by widening the list of system items.
+
+The clock stays visible and everything else about it behaves normally. Other menu bar managers on macOS 27 have the same limit for the same reason.
 
 ## Reveal Hidden Icons (notched Macs, macOS 14 to 26)
 
