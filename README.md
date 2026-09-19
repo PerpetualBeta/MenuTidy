@@ -1,32 +1,37 @@
 # MenuTidy
 
-> ## Does not work on macOS 27
+> ## macOS 27 works differently
 >
-> **macOS 27 changed how the menu bar works and what the system exposes to
-> apps.** MenuTidy hides icons by placing an invisible spacer in the menu bar
-> and expanding it to push icons out of sight. On macOS 27 that has no effect.
-> The icons stay visible.
+> **It works again, but by a different route.** macOS 27 draws the whole menu bar
+> as a single window. MenuTidy used to hide icons with an invisible spacer that
+> pushed its neighbours off the edge, and there are no longer any neighbouring
+> windows to push, so that technique cannot work on 27 and never will again.
 >
-> **There is no workaround yet.** Nothing in Apple's documentation or in the
-> public domain offers a route back, and MenuTidy in its current form cannot do
-> what it was built to do. The investigation is still open rather than
-> abandoned; progress is tracked in
-> [issue #4](https://github.com/PerpetualBeta/MenuTidy/issues/4).
+> Instead, MenuTidy now asks macOS to do the hiding. It tells the system which
+> icons should stay and the system hides the rest and reflows the bar itself.
+> Collapsing is instant, no app is restarted, and there is no spacer.
 >
-> macOS 27 does have a menu bar hider of its own, but it works differently and
-> does not offer the same functionality, so it is not a replacement for what
-> MenuTidy did.
+> Two things follow from that, both only on macOS 27:
 >
-> **On macOS 14 through 26 nothing has changed.** MenuTidy works exactly as it
-> always did, the app is still signed and notarised, and the update feed stays
-> up. If you are on one of those versions this notice does not affect you.
+> - **Accessibility is required, not optional.** MenuTidy has to work out which
+>   icons sit to the left of the chevron, and that is the only way to ask. On
+>   macOS 14 to 26 the permission was needed only for Reveal Hidden Icons.
+> - **Reveal Hidden Icons is gone, because macOS 27 does it.** The system grew
+>   its own control for reaching icons tucked behind the notch, which is what
+>   that feature existed for.
+>
+> **On macOS 14 through 26 nothing has changed at all** — same spacer, same
+> behaviour, same Reveal Hidden Icons.
+>
+> Raised as [issue #4](https://github.com/PerpetualBeta/MenuTidy/issues/4) by a
+> user on the day macOS 27 shipped, and fixed the same day.
 
 A lightweight macOS menu bar manager that keeps your menu bar clean by collapsing third-party icons out of sight. Click to expand and reveal them when needed.
 
 ## Requirements
 
-- macOS 14 (Sonoma) through macOS 26 (Tahoe)
-- **Not macOS 27** — see the notice above
+- macOS 14 (Sonoma) or later
+- On macOS 27, Accessibility permission is required — see the notice above
 
 ## Installation
 
@@ -45,11 +50,20 @@ After installation, launch MenuTidy — a chevron icon (`»`) appears in your me
 
 ## How It Works
 
-MenuTidy adds two elements to your menu bar: a **chevron** (the visible icon you click) and a **spacer** (an invisible divider). When collapsed, the spacer expands to push icons to its left out of view.
+There are two mechanisms, because macOS 27 changed the menu bar.
+
+**On macOS 14 to 26**, MenuTidy adds two elements: a **chevron** (the visible icon you click) and a **spacer** (an invisible divider). When collapsed, the spacer expands to push icons to its left out of view.
 
 ```
 Expanded:   [hidden icons] | [visible icons] [chevron] [system icons]
 Collapsed:                   [visible icons] [chevron] [system icons]
+```
+
+**On macOS 27**, the whole menu bar is a single window, so there is nothing for a spacer to push. There is no spacer at all. MenuTidy instead tells macOS which icons should stay and the system hides the rest and reflows the bar itself. The **chevron is the boundary**: everything to its left is hidden, everything to its right stays.
+
+```
+Expanded:   [hidden icons] [chevron] [visible icons] [system icons]
+Collapsed:                 [chevron] [visible icons] [system icons]
 ```
 
 - **Left-click** the chevron to toggle between collapsed and expanded
@@ -58,6 +72,8 @@ Collapsed:                   [visible icons] [chevron] [system icons]
 ## Setting Up
 
 On first launch, MenuTidy starts in the **expanded** state so you can arrange your icons.
+
+> On **macOS 27** there is no spacer, so ignore the `command`-drag instructions below. Drag icons in the menu bar the ordinary way (`command`-drag, as macOS itself allows) and put the ones you want kept to the **right of the chevron**.
 
 ### Choosing which icons to hide
 
@@ -80,20 +96,22 @@ You can also move the spacer itself. Hold `command` and drag the glowing blue ba
 |---|---|
 | Left-click chevron | Toggle collapse/expand |
 | Right-click chevron | Open settings menu |
-| Hold `command` | Reveal the spacer position (blue bar) |
-| `command`+drag an icon | Move it between hidden/visible zones |
+| Hold `command` | Reveal the spacer position (blue bar) — macOS 14 to 26 only |
+| `command`+drag an icon | Move it between hidden/visible zones (on macOS 27, either side of the chevron) |
 
 ## Right-click Menu
 
 Right-click the chevron for the standard Jorvik menu:
 
 - **About MenuTidy**
-- **Reveal Hidden Icons…** — only shown on Macs with a notch (see below)
+- **Reveal Hidden Icons…** — only on Macs with a notch, and only on macOS 14 to 26 (see below)
 - **Check for Updates…** — runs a Sparkle-powered update check
 - **Settings…**
 - **Quit MenuTidy** — exit the app (all hidden icons reappear)
 
-## Reveal Hidden Icons (notched Macs)
+## Reveal Hidden Icons (notched Macs, macOS 14 to 26)
+
+> **Not present on macOS 27.** The system grew its own control for reaching icons tucked behind the notch, so MenuTidy no longer offers a second answer to the same question. Everything in this section applies to macOS 14 through 26.
 
 On 14"/16" MacBook Pros and notched MacBook Airs, the menu bar wraps around the notch — and when you have more status icons than fit in the right-hand segment, the leftmost ones get clipped behind the notch with no way to click them.
 
@@ -118,7 +136,7 @@ Default is 22. **Err low if you change it** — too small only reverts to missin
 ### Settings…
 
 - **Auto-collapse** — automatically collapse the bar a few seconds after the pointer leaves it (0–999 seconds; 0 = immediately). Off by default; see below
-- **Permissions → Accessibility** — required for **Reveal Hidden Icons**; shows live status with a Grant Access button if not yet granted
+- **Permissions → Accessibility** — on macOS 14 to 26, required only for **Reveal Hidden Icons**. **On macOS 27 it is required for collapsing to work at all**, because MenuTidy has to work out which icons sit left of the chevron. The row says which applies, and shows live status with a Grant Access button
 - **Menu bar icon pill** — optional grey background for stronger contrast on busy or wallpaper-tinted menu bars (off by default)
 - **General → Launch at Login** — start MenuTidy automatically when you log in
 
@@ -126,7 +144,7 @@ Auto-updates are handled by Sparkle. Use the **Check for Updates…** menu item 
 
 ## Behaviour on Restart
 
-- MenuTidy remembers where you've placed the chevron and the spacer across restarts — your drag-arrangement of either persists
+- MenuTidy remembers where you've placed the chevron, and the spacer on macOS 14 to 26, across restarts — your drag-arrangement persists
 - Other apps' icon positions are preserved by macOS in their own preferences, so the layout you build once stays put
 - On subsequent launches, MenuTidy automatically collapses after a short delay to let all icons load into their saved positions first
 
@@ -170,11 +188,15 @@ Then relaunch the app.
 
 ### Icons aren't hiding
 
-Make sure the icons you want hidden are to the **left** of the spacer (the glowing blue bar that appears when you hold `command`). Icons to the right of the spacer are excluded from hiding.
+On **macOS 14 to 26**, make sure the icons you want hidden are to the **left** of the spacer (the glowing blue bar that appears when you hold `command`). Icons to the right of the spacer are excluded from hiding.
+
+On **macOS 27**, check two things. Icons you want hidden must be to the **left of the chevron**. And Accessibility must be granted — without it MenuTidy cannot tell which icons to keep, so it refuses to collapse rather than risk hiding everything. Clicking the chevron will say so and offer to open the right settings pane.
 
 ### The spacer isn't visible
 
 The spacer is only visible when you hold the `command` key. In normal use it's completely invisible.
+
+There is no spacer at all on **macOS 27** — the chevron is the boundary instead.
 
 ---
 
