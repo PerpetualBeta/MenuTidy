@@ -14,6 +14,8 @@ BUILD_SYSTEM     := swiftc
 
 SWIFT_FRAMEWORKS := Cocoa ServiceManagement SwiftUI
 SWIFT_SOURCES    := main.swift \
+                    MenuBarRestriction.swift \
+                    MenuBarInventory.swift \
                     AboutView.swift \
                     MenuTidySettingsContent.swift
 
@@ -38,6 +40,13 @@ LOCAL_INSTALL_DIR := /Applications
 # binary + version stamping for speed.
 dev-build:
 	@echo "→ dev build (arm64 only, ad-hoc)"
+	# Start from nothing. Without this, `cp -R Sparkle.framework <dest>` copies
+	# INTO the existing directory on every rebuild after the first, producing
+	# Sparkle.framework/Sparkle.framework. codesign then reports "unsealed
+	# contents present in the root directory of an embedded framework", the
+	# signature is not a valid Developer ID one, and macOS silently withholds
+	# every TCC permission the app has been granted.
+	@rm -rf $(LOCAL_BUNDLE)
 	@mkdir -p $(LOCAL_BUNDLE)/Contents/MacOS $(LOCAL_BUNDLE)/Contents/Resources $(LOCAL_BUNDLE)/Contents/Frameworks
 	cp -R Sparkle.framework $(LOCAL_BUNDLE)/Contents/Frameworks/Sparkle.framework
 	swiftc -O -target arm64-apple-macos14.0 -sdk $(SDK) \

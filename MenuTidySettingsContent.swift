@@ -6,9 +6,16 @@ import ApplicationServices
 ///  - Permissions (Accessibility status + grant button)
 ///  - Menu Bar Icon (JorvikKit's standard pill settings)
 ///
-/// Accessibility is required by the Reveal Hidden Icons feature so MenuTidy
-/// can enumerate other apps' status items via the AX API. Without it, the
-/// reveal panel comes up empty.
+/// Accessibility is needed for two different reasons depending on the OS, and
+/// the row explains whichever one applies:
+///
+/// - macOS 14-26: by Reveal Hidden Icons, to enumerate other apps' status items
+///   via the AX API. Without it the reveal panel comes up empty, but collapsing
+///   still works, because the spacer needs no permission.
+/// - macOS 27 and later: to work out which icons sit left of the chevron, which
+///   is what the collapse allow-list is built from. **Without it MenuTidy cannot
+///   collapse at all** — it refuses rather than hide every icon on the Mac.
+///   That makes it a hard requirement on 27, not an optional extra.
 ///
 /// Launch at Login and Updates sections are provided by JorvikSettingsView
 /// itself, so they don't need to appear here.
@@ -24,23 +31,41 @@ struct MenuTidySettingsContent: View {
         MenuTidyAutoCollapseSettings(onChanged: onAutoCollapseChanged)
 
         Section("Permissions") {
-            HStack {
-                Text("Accessibility")
-                Spacer()
-                if accessibility.isGranted {
-                    Label("Granted", systemImage: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("Accessibility")
+                    Spacer()
+                    if accessibility.isGranted {
+                        Label("Granted", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                            .font(.caption)
+                    } else {
+                        Button("Grant Access") {
+                            JorvikPermissionWatcher.promptForAccessibility()
+                        }
                         .font(.caption)
-                } else {
-                    Button("Grant Access") {
-                        JorvikPermissionWatcher.promptForAccessibility()
                     }
-                    .font(.caption)
                 }
+                Text(accessibilityReason)
+                    .font(.caption)
+                    .foregroundStyle(accessibility.isGranted ? .secondary : .primary)
             }
         }
 
         MenuBarPillSettings(onChanged: onPillChanged)
+    }
+
+    /// Says what the permission is actually for on this Mac. On macOS 27 it is
+    /// required for the app to work at all, so the wording is blunter.
+    private var accessibilityReason: String {
+        if MenuBarRestriction.isAvailable {
+            return accessibility.isGranted
+                ? "Used to work out which icons sit to the left of the chevron."
+                : "Required. Without it MenuTidy cannot tell which icons to hide, so collapsing does nothing."
+        }
+        return accessibility.isGranted
+            ? "Used by Reveal Hidden Icons to list icons hidden behind the notch."
+            : "Needed only by Reveal Hidden Icons. Collapsing works without it."
     }
 }
 

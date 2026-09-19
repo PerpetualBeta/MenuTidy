@@ -1,4 +1,5 @@
 import Cocoa
+import Combine
 import ServiceManagement
 import SwiftUI
 import ApplicationServices
@@ -43,11 +44,26 @@ enum MTDebug {
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     var chevronItem: NSStatusItem!
-    var spacerItem: NSStatusItem!
+    /// The invisible spacer that does the hiding on macOS 14-26. Not created
+    /// at all on macOS 27, where the bar is one window and an over-wide item
+    /// pushes nothing — it would just be a second, useless MenuTidy entry in
+    /// the user's menu bar. Optional rather than implicitly unwrapped so its
+    /// absence is a fact the code has to handle, not a crash.
+    var spacerItem: NSStatusItem?
     var cmdMonitor: Any?
     var mouseMonitor: Any?
     var spacerVisible = false
     var revealPanel: HiddenIconsPanel?
+    /// Accessibility state, kept current by JorvikKit.
+    ///
+    /// NOT a raw `AXIsProcessTrusted()` poll. That call is cached in-process and
+    /// the system announcement invalidates the cache, so **the first read after
+    /// an announcement is the one that refetches — and a read taken too soon
+    /// refetches the OLD answer and pins it there.** Reading more often makes it
+    /// strictly worse. `JorvikPermissionWatcher` exists precisely because of
+    /// that; read its notes before changing this.
+    private let accessibility = JorvikPermissionWatcher.accessibility()
+    private var accessibilityCancellable: AnyCancellable?
     // Captured when the right-click menu is built: opening that menu dismisses
     // the panel (resignKey) before the menu item fires, so we can't ask the live
     // panel whether it was open — we decide the toggle from this snapshot.
@@ -88,8 +104,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Pre-warm the hidden-icons cache so opening the reveal panel is
         // instant. Only meaningful on notched displays — gated to avoid
         // pointless AX work elsewhere.
-        if HiddenIcons.notchHorizontalRange() != nil {
+        // Pointless on macOS 27, where the reveal panel is never offered: this
+        // cache exists only to make that panel open instantly, and filling it
+        // means background Accessibility work for a feature that cannot run.
+        if HiddenIcons.notchHorizontalRange() != nil && !MenuBarRestriction.isAvailable {
             HiddenIcons.startCaching()
+        }
+
+        // First inventory for the macOS 27 collapse path, in the background.
+        // Deliberately outside the notch gate above: the hidden-icons cache is
+        // only useful on a notched display, but collapsing is not.
+        MenuBarInventory.refresh()
+        // Take an inventory whenever the permission arrives, so granting it never
+        // requires a restart. The watcher handles the announcement and the stale
+        // read that follows it; this only reacts to the settled answer.
+        if MenuBarRestriction.isAvailable {
+            accessibilityCancellable = accessibility.$isGranted
+                .removeDuplicates()
+                .sink { granted in
+                    MTDebug.log("accessibility now \(granted ? "granted" : "not granted")")
+                    if granted { MenuBarInventory.refresh() }
+                }
         }
 
         let hasLaunchedBefore = UserDefaults.standard.bool(forKey: hasLaunchedBeforeKey)
@@ -151,14 +186,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             updateIcon()
         }
 
-        // Create spacer second (to the left, among third-party items)
-        spacerItem = NSStatusBar.system.statusItem(withLength: 0)
-        spacerItem.autosaveName = "MenuTidySpacer"
+        // Create spacer second (to the left, among third-party items). Skipped
+        // entirely on macOS 27: there the restriction does the hiding, and a
+        // spacer would only clutter the bar with a second MenuTidy item.
+        if !MenuBarRestriction.isAvailable {
+            let spacer = NSStatusBar.system.statusItem(withLength: 0)
+            spacer.autosaveName = "MenuTidySpacer"
+            spacerItem = spacer
+        }
     }
 
     // MARK: ⌘ Key Monitor
 
     func setupCmdKeyMonitor() {
+        // No spacer on macOS 27 means nothing to reveal, so no global monitor.
+        guard !MenuBarRestriction.isAvailable else { return }
         cmdMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
             guard let self else { return }
             if event.modifierFlags.contains(.command) {
@@ -211,7 +253,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func showSpacer() {
-        guard !isCollapsed, !spacerVisible else { return }
+        guard !isCollapsed, !spacerVisible, let spacerItem else { return }
         spacerVisible = true
         spacerItem.length = 10
         if let button = spacerItem.button {
@@ -250,7 +292,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func hideSpacer() {
         spacerVisible = false
-        guard !isCollapsed else { return }
+        guard !isCollapsed, let spacerItem else { return }
         spacerItem.length = 0
         spacerItem.button?.image = nil
     }
@@ -267,7 +309,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: Click Handling
 
     @objc func statusItemClicked(_ sender: Any?) {
-        guard let event = NSApp.currentEvent else { return }
+        guard let event = NSApp.currentEvent else {
+            MTDebug.log("click: handler fired but NSApp.currentEvent was nil — ignoring")
+            return
+        }
+        MTDebug.log("click: type=\(event.type.rawValue) collapsed=\(isCollapsed)")
         if event.type == .rightMouseUp {
             showMenu()
         } else {
@@ -276,6 +322,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func toggle() {
+        MTDebug.log("toggle: collapsed=\(isCollapsed) -> \(isCollapsed ? "expand" : "collapse")")
         if isCollapsed { expand() } else { collapse() }
     }
 
@@ -371,7 +418,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 guard self.autoCollapseEnabled, !self.isCollapsed,
                       !self.pointerInMenuBar(), !self.revealPanelOpen else { return }
                 MTDebug.log("auto-collapse: firing collapse")
-                self.collapse()
+                self.collapse(userInitiated: false)
             }
             autoCollapsePending = work
             DispatchQueue.main.asyncAfter(deadline: .now() + autoCollapseDelay, execute: work)
@@ -380,7 +427,90 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: Collapse / Expand
 
-    func collapse() {
+    /// Ask for Accessibility, which macOS 27 collapsing cannot work without.
+    ///
+    /// Two steps, because one is not enough. `promptForAccessibility` shows the
+    /// system dialog, but macOS shows that only once per app — a user who
+    /// dismissed it, or whose grant was reset, sees nothing at all. So if the
+    /// permission still is not there, explain and offer to open the pane
+    /// directly, which is the only route back.
+    private func requestAccessibilityForCollapse() {
+        // Deliberately does NOT also call promptForAccessibility(). That shows
+        // the system dialog, which macOS displays only once per app — so on a
+        // first run the user got two dialogs stacked on each other, and on every
+        // run after that the system one silently did nothing. One dialog that
+        // always appears and always offers a route is better than two that
+        // sometimes do.
+        let alert = NSAlert()
+        alert.messageText = "MenuTidy needs Accessibility to collapse the menu bar"
+        alert.informativeText = """
+            On macOS 27 the system hides the icons for MenuTidy, and MenuTidy has \
+            to tell it which ones to keep. Working that out needs Accessibility.
+
+            Without it, clicking the chevron cannot do anything.
+            """
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Open Settings")
+        alert.addButton(withTitle: "Later")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            JorvikPermissionWatcher.openSettings(pane: .accessibility)
+        }
+    }
+
+    /// Collapse by restricting the menu bar (macOS 27 and later).
+    ///
+    /// Everything from the chevron rightwards stays; everything left of it is
+    /// hidden. MenuTidy always keeps itself, because the chevron is the only way
+    /// back — hiding it would leave the user with no way to expand.
+    private func applyMenuBarRestriction(userInitiated: Bool) {
+        // Without Accessibility the inventory is empty, which is indistinguishable
+        // from "no other apps have items". Acting on that would hide every icon
+        // on the Mac and leave only the chevron. Refuse instead.
+        //
+        // Refusing quietly is not enough. On macOS 27 this permission is the
+        // difference between the app working and the chevron appearing dead, and
+        // a silent refusal leaves the user with nothing to act on — no error, no
+        // hint, and the only route to Settings is the very menu they are trying
+        // to use. So say so, but only when they actually clicked: auto-collapse
+        // firing in the background must never throw an alert at anyone.
+        guard accessibility.isGranted else {
+            MTDebug.log("collapse skipped: Accessibility not granted, cannot tell which icons to keep")
+            isCollapsed = false
+            if userInitiated { requestAccessibilityForCollapse() }
+            return
+        }
+
+        guard let chevronX = chevronItem.button?.window?.frame.minX else {
+            MTDebug.log("collapse skipped: chevron has no window yet")
+            isCollapsed = false
+            return
+        }
+
+        // Read the cached snapshot. Walking here would freeze the app: one full
+        // Accessibility sweep was measured at 29.3 seconds across 192 running
+        // apps, which swallowed the next click and opened menus half a minute
+        // late. The snapshot is taken in the background while expanded.
+        guard MenuBarInventory.hasSnapshot else {
+            MTDebug.log("collapse skipped: no inventory yet — refreshing, try again in a moment")
+            MenuBarInventory.refresh()
+            isCollapsed = false
+            return
+        }
+        let inventory = MenuBarInventory.snapshot
+        MTDebug.log("collapse: chevronX=\(Int(chevronX)) from \(inventory.count) cached item(s)")
+        var keep = MenuBarInventory.bundleIdentifiers(atOrRightOf: chevronX)
+        if let ownIdentifier = Bundle.main.bundleIdentifier, !keep.contains(ownIdentifier) {
+            keep.append(ownIdentifier)
+        }
+
+        if !MenuBarRestriction.restrict(toVisible: keep) {
+            MTDebug.log("collapse failed: the menu bar restriction could not be applied")
+            isCollapsed = false
+        }
+    }
+
+    func collapse(userInitiated: Bool = true) {
         isCollapsed = true
         stopAutoCollapseTracking()
         // Collapsing hides the very icons a Reveal panel is listing, so dismiss
@@ -389,7 +519,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // collapse — clicking the chevron while Reveal is up.
         revealPanel?.close()
         revealPanel = nil
-        spacerItem.length = 10_000
+
+        // macOS 27 draws the whole bar as one window, so the spacer has nothing
+        // to push and hides nothing. There, ask macOS to restrict the bar
+        // instead. Everything earlier keeps the spacer, unchanged.
+        if MenuBarRestriction.isAvailable {
+            applyMenuBarRestriction(userInitiated: userInitiated)
+            updateIcon()
+            return      // the off-screen safety check below is a spacer concern only
+        }
+
+        spacerItem?.length = 10_000
         updateIcon()
 
         // Safety: if the chevron got pushed off-screen, undo immediately
@@ -428,7 +568,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // arrangement) would collapse, revert, and collapse again on a loop.
     func expand(startTracking: Bool = true) {
         isCollapsed = false
-        spacerItem.length = 0
+        if MenuBarRestriction.isAvailable {
+            MenuBarRestriction.release()
+            // Re-inventory now the bar is whole again. A restricted bar
+            // under-reports, so a snapshot taken during a collapse would shrink
+            // the allow-list a little more each cycle.
+            MenuBarInventory.refresh()
+        } else {
+            spacerItem?.length = 0
+        }
         updateIcon()
         if startTracking {
             startAutoCollapseTracking()
@@ -438,6 +586,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: Menu
 
     func showMenu() {
+        MTDebug.log("showMenu: opening the right-click menu")
         // Snapshot the panel's open state *before* performClick opens the menu
         // (which dismisses the panel), so revealHiddenIcons() can toggle it off.
         revealPanelWasOpenAtMenuInvoke = (revealPanel?.isVisible == true)
@@ -532,14 +681,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             attributedTitle: tipText
         )
 
-        var actions: [JorvikMenuBuilder.ActionItem] = [tip]
+        var actions: [JorvikMenuBuilder.ActionItem] = []
+        let separator = JorvikMenuBuilder.ActionItem(
+            title: "-", action: #selector(NSObject.description), target: self
+        )
+
+        // The tip explains how to drag icons past the spacer. There is no spacer
+        // on macOS 27, so the advice would be nonsense there.
+        if !MenuBarRestriction.isAvailable {
+            actions.append(tip)
+        }
 
         // Only offer the reveal action on notched displays, and only while the
         // bar is expanded — when collapsed, every third-party icon is shoved
         // off-screen to the spacer sentinel (~-4400), so there's nothing
         // meaningful to reveal or activate.
-        if HiddenIcons.notchHorizontalRange() != nil && !isCollapsed {
-            actions.append(.init(title: "-", action: #selector(NSObject.description), target: self))
+        //
+        // Not offered on macOS 27 at all: the system grew its own overflow
+        // chevron for exactly this, and doing it ourselves as well would be two
+        // competing answers to one question. Jonathan's call, and it makes the
+        // app smaller on the newer OS rather than larger.
+        if HiddenIcons.notchHorizontalRange() != nil && !isCollapsed && !MenuBarRestriction.isAvailable {
+            if !actions.isEmpty { actions.append(separator) }
             actions.append(.init(
                 title: "Reveal Hidden Icons\u{2026}",
                 action: #selector(revealHiddenIcons),
@@ -547,7 +710,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             ))
         }
 
-        actions.append(.init(title: "-", action: #selector(NSObject.description), target: self))
+        // Only separate from what came before if there IS anything before, or
+        // the menu opens with a stray divider under About.
+        if !actions.isEmpty { actions.append(separator) }
         actions.append(.init(
             title: "Check for Updates\u{2026}",
             action: #selector(checkForUpdates(_:)),
