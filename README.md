@@ -19,9 +19,10 @@
 > - **Reveal Hidden Icons is gone, because macOS 27 does it.** The system grew
 >   its own control for reaching icons tucked behind the notch, which is what
 >   that feature existed for.
-> - **Notification Centre cannot be opened from the clock while collapsed.**
->   Two-finger swipe in from the right edge of the trackpad instead, or expand
->   MenuTidy first. See below for why.
+> - **Notification Centre works from the clock again**, collapsed or expanded,
+>   as of 2.3.0. macOS will not open it while the bar is restricted, so MenuTidy
+>   lifts the restriction for a moment, opens it for you, and puts the
+>   restriction back. See below.
 >
 > **On macOS 14 through 26 nothing has changed at all** — same spacer, same
 > behaviour, same Reveal Hidden Icons.
@@ -63,6 +64,8 @@ Collapsed:                   [visible icons] [chevron] [system icons]
 ```
 
 **On macOS 27**, the whole menu bar is a single window, so there is nothing for a spacer to push. There is no spacer at all. MenuTidy instead tells macOS which icons should stay and the system hides the rest and reflows the bar itself. The **chevron is the boundary**: everything to its left is hidden, everything to its right stays.
+
+An icon wide enough to straddle the chevron is kept. Hiding it would leave its rectangle sitting on top of the chevron, and macOS does not reclaim the space an icon occupied when it stops drawing it, so the chevron would become unclickable. Icons that show text, such as a music player showing the track title, are the ones wide enough for this to matter.
 
 ```
 Expanded:   [hidden icons] [chevron] [visible icons] [system icons]
@@ -112,16 +115,52 @@ Right-click the chevron for the standard Jorvik menu:
 - **Settings…**
 - **Quit MenuTidy** — exit the app (all hidden icons reappear)
 
-## Notification Centre while collapsed (macOS 27)
+## Notification Centre (macOS 27)
 
-While the bar is collapsed, **clicking the clock does not open Notification Centre**. Two ways round it:
+**It works.** Click the clock, collapsed or expanded, and Notification Centre opens as usual. Before 2.3.0 the click did nothing while collapsed.
 
-- **Two-finger swipe in from the right edge of the trackpad.** This works normally while collapsed.
-- **Expand MenuTidy first**, then click the clock as usual.
+It is worth knowing what happens, because you will see it. While the bar is collapsed macOS is holding it under a restriction, and it refuses to open Notification Centre while one is active. There is no setting for that: the facility macOS 27 uses to hide menu bar items was built for exam lockdown, and withholding notifications is one of the things it is *for*. Asking the clock to press itself is refused in exactly the same silent way as a mouse click.
 
-This is a limit of the mechanism rather than a bug that can be fixed. macOS 27 hides menu bar items through a facility built for exam lockdown, and suppressing access to notifications is one of the things that facility is *for*. It takes a list of what to keep, and no entry in that list re-enables Notification Centre — tested both by naming the apps that own the clock and by widening the list of system items.
+So MenuTidy does the one thing that does work. It drops the restriction, opens Notification Centre for you, and puts the restriction straight back. The bar is unrestricted for roughly two to four tenths of a second, and **your hidden icons are genuinely drawn again for that moment**, because for that moment the bar genuinely is not restricted. You will see a brief flicker. That is the whole cost.
 
-The clock stays visible and everything else about it behaves normally. Other menu bar managers on macOS 27 have the same limit for the same reason.
+If you would rather have the old behaviour, where the click simply does nothing:
+
+```
+defaults write cc.jorviksoftware.MenuTidy relayClockClick -bool NO
+```
+
+A two-finger swipe in from the right edge of the trackpad opens Notification Centre too, restriction or no restriction, and always did.
+
+Other menu bar managers on macOS 27 meet the same wall, for the same reason.
+
+## When the menu bar is too full (macOS 27)
+
+macOS 27 drops menu bar icons of its own accord once the bar runs out of room, and it will drop icons MenuTidy has asked it to keep. Telling macOS an icon *may* be shown does not reserve space for it.
+
+A dropped icon also **keeps its rectangle**. It stops being drawn, but the space it occupied stays claimed, so part of the menu bar becomes a dead region where clicks reach nothing at all. If that region lands on MenuTidy's chevron, the chevron stops responding and looks broken. It is not broken; there is simply nothing there to click.
+
+None of that is something MenuTidy can fix, and all of it looks exactly like MenuTidy misbehaving. So from 2.3.0 it tells you. A small panel drops from the notch, once per run, when either:
+
+- macOS has added **its own** chevron to the menu bar, which it does only while it is actually hiding icons, or
+- your status icons need 80% or more of the screen's width.
+
+The first is the signal worth trusting, because it is a fact rather than a forecast. On the Mac this was developed on it fired at 67% full while macOS was already dropping icons — the percentage on its own would have said nothing.
+
+The remedy is to put less in the menu bar: quit an app you are not using, or remove a system icon in Control Centre settings.
+
+The width threshold is adjustable. The other trigger is not: if macOS is actively hiding your icons, that is worth knowing about.
+
+```
+defaults write cc.jorviksoftware.MenuTidy menuBarFullThreshold -float 0.9
+```
+
+The panel hangs from the notch and is sized to clear the physical cutout, which no API describes. If its edges look wrong on your Mac:
+
+```
+defaults write cc.jorviksoftware.MenuTidy notchClearance -float 8
+```
+
+Default is 6.
 
 ## Reveal Hidden Icons (notched Macs, macOS 14 to 26)
 
