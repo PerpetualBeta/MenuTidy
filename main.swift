@@ -21,19 +21,39 @@ enum MTDebug {
             .appendingPathComponent("Library/Logs/MenuTidy", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let url = dir.appendingPathComponent("menutidy.log")
-        if !FileManager.default.fileExists(atPath: url.path) {
-            FileManager.default.createFile(atPath: url.path, contents: nil)
-        }
-        let h = try? FileHandle(forWritingTo: url)
-        _ = try? h?.seekToEnd()
-        return h
+        // Opened O_APPEND rather than with FileHandle(forWritingTo:) + seek.
+        //
+        // Two processes write to this file: the app and the holder it spawns.
+        // Each FileHandle carries its OWN offset, so with a plain seek-to-end
+        // they both write at the position the file had when they started, and
+        // clobber each other's lines. Measured 2026-09-20: of four holder
+        // start-ups only one left a line, and truncating the file while the app
+        // held it open padded the gap with NUL bytes.
+        //
+        // O_APPEND makes the kernel place every write at the true end of the
+        // file at the moment of the write, whichever process makes it.
+        let descriptor = open(url.path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+        guard descriptor >= 0 else { return nil }
+        return FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
     }()
 
     private static let lock = NSLock()
 
+    /// Every line is stamped with the time.
+    ///
+    /// Added 2026-09-20 after a night spent unable to tell an app that had
+    /// stopped reacting from a user who had stopped clicking: the log showed no
+    /// new lines in both cases, and without a clock there was no way to know
+    /// which. A wrong conclusion was drawn from exactly that ambiguity.
+    private static let stamp: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss.SSS"
+        return formatter
+    }()
+
     static func log(_ message: @autoclosure () -> String) {
         guard enabled, let handle else { return }
-        let line = message() + "\n"
+        let line = stamp.string(from: Date()) + "  " + message() + "\n"
         guard let data = line.data(using: .utf8) else { return }
         lock.lock(); defer { lock.unlock() }
         handle.write(data)
@@ -67,6 +87,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// menu dismissal expanded the bar, and since a recovery deliberately does
     /// not re-arm auto-collapse, it switched auto-collapse off as well.
     private var menuIsOpen = false
+    /// Said once per run. See `warnIfTheBarIsTooFull()`.
+    private var hasSaidTheBarIsFull = false
     var spacerVisible = false
     var revealPanel: HiddenIconsPanel?
     /// Accessibility state, kept current by JorvikKit.
@@ -130,7 +152,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // First inventory for the macOS 27 collapse path, in the background.
         // Deliberately outside the notch gate above: the hidden-icons cache is
         // only useful on a notched display, but collapsing is not.
-        MenuBarInventory.refresh()
+        MenuBarInventory.refresh { [weak self] in self?.warnIfTheBarIsTooFull() }
         // Take an inventory whenever the permission arrives, so granting it never
         // requires a restart. The watcher handles the announcement and the stale
         // read that follows it; this only reacts to the settled answer.
@@ -593,7 +615,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // Re-inventory now the bar is whole again. A restricted bar
             // under-reports, so a snapshot taken during a collapse would shrink
             // the allow-list a little more each cycle.
-            MenuBarInventory.refresh()
+            MenuBarInventory.refresh { [weak self] in self?.warnIfTheBarIsTooFull() }
         } else {
             spacerItem?.length = 0
         }
@@ -690,6 +712,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // takes a few hundred milliseconds and the menu will have closed by
             // then, so asking later always answers "no menu".
             guard !self.menuIsOpen else { return }
+            // Independent of the chevron check below, and deliberately not
+            // exclusive with it: the clock is the rightmost item in the bar and
+            // is always allow-listed, so a click can never be inside both it
+            // and this app's chevron.
+            if event.type == .leftMouseUp {
+                self.relayClockClickIfItWentNowhere(at: NSEvent.mouseLocation.x)
+            }
             self.checkWhetherClickMissedTheChevron(at: NSEvent.mouseLocation.x,
                                                    wasRightButton: event.type == .rightMouseUp,
                                                    clickedAt: Date())
@@ -819,6 +848,125 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // MARK: Menu
+
+    /// The share of the screen's width at which the menu bar counts as too
+    /// full, as a fraction. `defaults write cc.jorviksoftware.MenuTidy
+    /// menuBarFullThreshold -float 0.7` moves it.
+    ///
+    /// 0.8 is Jonathan's figure and it came from measurement rather than taste.
+    /// His bar sat at 59% with 23 items and behaved. It reached roughly 82%
+    /// when Ballast put a long track title in it, and that is when macOS began
+    /// dropping items of its own accord.
+    private var menuBarFullThreshold: CGFloat {
+        let stored = UserDefaults.standard.double(forKey: "menuBarFullThreshold")
+        return stored > 0 ? CGFloat(stored) : 0.8
+    }
+
+    /// Tell the user their menu bar is too full for macOS to lay out.
+    ///
+    /// ## What goes wrong when it is
+    ///
+    /// macOS 27 drops items when the bar runs out of room, and it drops
+    /// allow-listed ones too: the allow-list grants permission to be visible,
+    /// it does not reserve space. Worse, a dropped item **keeps its
+    /// rectangle**, so the bar is left with dead regions where a click reaches
+    /// nothing at all. Measured 2026-09-20: clicks posted at thirteen positions
+    /// from x=800 to x=1090 reached nothing, while the same sweep with a
+    /// shorter item present hit normally.
+    ///
+    /// None of that is something this app can fix, and it looks exactly like
+    /// this app misbehaving, so it is worth naming.
+    ///
+    /// ## Said once per run
+    ///
+    /// This is something to learn, not something to be nagged about. Once the
+    /// user knows, repeating it every time they expand the bar adds nothing.
+    private func warnIfTheBarIsTooFull() {
+        guard !hasSaidTheBarIsFull,
+              let width = NSScreen.main?.frame.width,
+              let share = MenuBarInventory.occupancy(ofScreenWidth: width),
+              share >= menuBarFullThreshold else { return }
+        hasSaidTheBarIsFull = true
+        MTDebug.log(String(format:
+            "menu bar is %.0f%% full (%.0f pt of %.0f pt), at or past the %.0f%% mark — macOS may start dropping items and leaving dead rectangles",
+            share * 100, share * width, width, menuBarFullThreshold * 100))
+        NotchWarning.show(title: "Menu bar is full", detail: "macOS may hide icons itself")
+    }
+
+    /// Whether a click on the clock should be relayed while the bar is
+    /// collapsed. On by default; `defaults write cc.jorviksoftware.MenuTidy
+    /// relayClockClick -bool NO` restores the behaviour 2.2.1 shipped, where
+    /// the click simply does nothing.
+    ///
+    /// A knob rather than a fixed choice because the cost of the fix is
+    /// visible: every hidden icon flashes back for the length of the swap. How
+    /// acceptable that is can only be judged by looking at it.
+    private var relayClockClick: Bool {
+        UserDefaults.standard.object(forKey: "relayClockClick") as? Bool ?? true
+    }
+
+    /// Finish a click on the clock that macOS refused to act on.
+    ///
+    /// While the bar is collapsed a restriction is active, and macOS will not
+    /// open Notification Centre while one is — see
+    /// `MenuBarRestriction.withRestrictionLifted(do:)` for the measurements.
+    /// The clock still draws the right time; only the click is dead. Users
+    /// reported this against Hidden Bar as issue #421 as well, so it is not
+    /// something this app does wrong.
+    ///
+    /// This spots the dead click and completes it: drop the restriction, press
+    /// the clock, put the restriction back.
+    ///
+    /// ## Why the work is off the main thread
+    ///
+    /// Finding the clock is one Accessibility query against one system daemon,
+    /// not the full sweep, but it still crosses a process boundary and it runs
+    /// on every menu bar click made while collapsed. An earlier version of the
+    /// buried-chevron recovery put an Accessibility walk on the click path and
+    /// the collapse visibly lagged. Nothing here needs the main thread until
+    /// there is something to do.
+    private func relayClockClickIfItWentNowhere(at x: CGFloat) {
+        guard relayClockClick, MenuBarRestriction.isRestricting else { return }
+
+        // A click made while the panel is open is the user closing it, and the
+        // raw click already does that on its own — the panel dismisses on any
+        // click outside itself, restriction or no restriction. Pressing the
+        // clock as well would open it straight back, so the panel could never
+        // be closed this way. Measured 2026-09-20: four clicks in a row all
+        // left it open.
+        //
+        // Read here, on mouse-up, and that is early enough: measured in the
+        // same session, the panel is still listed at mouse-up and only goes
+        // afterwards.
+        guard !MenuBarInventory.isNotificationCentreShowing else {
+            MTDebug.log("clock: the panel is already open, so the click closes it by itself")
+            return
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard let clock = MenuBarInventory.systemClock(),
+                  x >= clock.x, x <= clock.x + clock.width else { return }
+            DispatchQueue.main.async {
+                // Re-checked: the bar may have expanded during the lookup, and
+                // if it has then the click the user made worked by itself.
+                guard MenuBarRestriction.isRestricting else { return }
+                // Mark the click as dealt with. Without this the buried-chevron
+                // recovery treats it as a click nobody handled and runs a full
+                // Accessibility walk 0.25s later to find out why — measured at
+                // 0.3s across 27 apps, after EVERY click on the clock, for an
+                // answer that was never in doubt.
+                self.lastHandledClick = Date()
+                MTDebug.log(String(format:
+                    "clock: a left-click at %.0f landed in the clock (%.0f-%.0f), which macOS ignores while restricted. Lifting the restriction to open Notification Centre.",
+                    x, clock.x, clock.x + clock.width))
+                MenuBarRestriction.withRestrictionLifted {
+                    if !MenuBarInventory.pressSystemClock() {
+                        MTDebug.log("clock: the press failed")
+                    }
+                }
+            }
+        }
+    }
 
     func showMenu() {
         MTDebug.log("showMenu: opening the right-click menu")

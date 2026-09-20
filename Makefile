@@ -16,6 +16,7 @@ SWIFT_FRAMEWORKS := Cocoa ServiceManagement SwiftUI
 SWIFT_SOURCES    := main.swift \
                     MenuBarRestriction.swift \
                     MenuBarInventory.swift \
+                    NotchWarning.swift \
                     AboutView.swift \
                     MenuTidySettingsContent.swift
 
@@ -36,10 +37,24 @@ include ../jorvik-release/release.mk
 LOCAL_BUNDLE := MenuTidy.app
 LOCAL_INSTALL_DIR := /Applications
 
+# Local builds are signed with the real Developer ID, not ad-hoc.
+#
+# This app cannot collapse the menu bar without Accessibility, and macOS keys a
+# TCC grant to the signing identity. An ad-hoc signature is a DIFFERENT identity,
+# so every grant the app holds is silently withheld: no error, no prompt, the
+# feature simply does nothing. That cost five wasted install-and-test rounds on
+# 2026-09-19 before it was spotted.
+#
+# `codesign --verify --strict` PASSES on an ad-hoc bundle, so it does not catch
+# this. Only the Team ID does, which is what the gate below checks.
+LOCAL_SIGN_ID  := Developer ID Application: Jonthan Hollin (EG86BCGUE7)
+LOCAL_TEAM_ID  := EG86BCGUE7
+SIGN_FRAMEWORK := ../jorvik-release/helpers/sign-framework.sh
+
 # Single-arch fast build for local install. Bypasses release.mk's universal
-# binary + version stamping for speed.
+# binary + version stamping for speed, but NOT its signing identity.
 dev-build:
-	@echo "→ dev build (arm64 only, ad-hoc)"
+	@echo "→ dev build (arm64 only, Developer ID)"
 	# Start from nothing. Without this, `cp -R Sparkle.framework <dest>` copies
 	# INTO the existing directory on every rebuild after the first, producing
 	# Sparkle.framework/Sparkle.framework. codesign then reports "unsealed
@@ -57,7 +72,15 @@ dev-build:
 		$(wildcard JorvikKit/*.swift)
 	cp Info.plist $(LOCAL_BUNDLE)/Contents/Info.plist
 	@if [ -f AppIcon.icns ]; then cp AppIcon.icns $(LOCAL_BUNDLE)/Contents/Resources/AppIcon.icns; fi
-	codesign --force --sign - $(LOCAL_BUNDLE)
+	@$(SIGN_FRAMEWORK) $(LOCAL_BUNDLE)/Contents/Frameworks/Sparkle.framework "$(LOCAL_SIGN_ID)"
+	@codesign --force --sign "$(LOCAL_SIGN_ID)" --options runtime --timestamp \
+		--entitlements $(ENTITLEMENTS) $(LOCAL_BUNDLE)
+	@# `grep` without -q on purpose. release.mk sets `-o pipefail`, and `grep -q`
+	@# exits the instant it matches, which kills codesign with a broken pipe and
+	@# makes the whole pipeline report failure on a signature that was correct.
+	@codesign -dv --verbose=2 $(LOCAL_BUNDLE) 2>&1 | grep 'TeamIdentifier=$(LOCAL_TEAM_ID)' > /dev/null \
+		|| { echo "REFUSING: $(LOCAL_BUNDLE) is not Developer ID signed — a TCC grant would be lost"; exit 1; }
+	@echo "→ signed Developer ID ($(LOCAL_TEAM_ID))"
 	@echo "→ Done: $(LOCAL_BUNDLE)"
 
 dev-install: dev-build

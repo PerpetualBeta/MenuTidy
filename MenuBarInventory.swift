@@ -181,6 +181,126 @@ enum MenuBarInventory {
         }
     }
 
+    // MARK: - How full the bar is
+
+    /// How much of the screen's width the status items need, as a fraction.
+    ///
+    /// The **sum of the item widths**, not the distance from the leftmost item
+    /// to the rightmost. Those are not the same thing once macOS is hiding
+    /// anything, because Accessibility reports a hidden item at the position it
+    /// would have had. Measured 2026-09-20 with 23 items: the span read 98% of
+    /// the screen while the items themselves came to 59%.
+    ///
+    /// Read from the snapshot, which is only ever taken while the bar is
+    /// expanded, so it describes everything the user owns rather than whatever
+    /// survived the last collapse.
+    ///
+    /// nil when no snapshot has been taken yet. That is not the same as an
+    /// empty menu bar and must not be treated as 0%.
+    static func occupancy(ofScreenWidth width: CGFloat) -> CGFloat? {
+        let items = snapshot
+        guard !items.isEmpty, width > 0 else { return nil }
+        return items.reduce(0) { $0 + $1.width } / width
+    }
+
+    // MARK: - The system clock
+
+    /// The app that owns the clock, and Notification Centre with it.
+    private static let clockOwnerBundleIdentifier = "com.apple.MenuBarAgent"
+
+    /// Accessibility identifier of the clock itself. Control Centre is the
+    /// other item this same app owns, so the two have to be told apart.
+    private static let clockAccessibilityIdentifier = "com.apple.menuextra.clock"
+
+    /// The clock's element and where it is drawn, read live.
+    ///
+    /// Not taken from the snapshot, for two reasons. `item(ofBundleIdentifier:)`
+    /// returns an app's LEFTMOST item, and the clock is the rightmost of this
+    /// app's two, so that lookup answers Control Centre. And this is asked on a
+    /// click, where a stale answer sends the click to the wrong place.
+    ///
+    /// The cost is one Accessibility query against one system daemon, measured
+    /// at under 30 ms, rather than the full sweep that `refresh()` exists to
+    /// keep off the click path. Callers still run it off the main thread.
+    static func systemClock() -> (element: AXUIElement, x: CGFloat, width: CGFloat)? {
+        guard isPermitted,
+              let app = NSWorkspace.shared.runningApplications.first(where: {
+                  $0.bundleIdentifier == clockOwnerBundleIdentifier
+              }) else { return nil }
+        let application = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(application, messagingTimeout)
+
+        var barValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(application, "AXExtrasMenuBar" as CFString,
+                                            &barValue) == .success,
+              let bar = barValue,
+              let clock = clockElement(under: bar as! AXUIElement, depth: 0),
+              let origin = position(of: clock) else { return nil }
+        return (clock, origin.x, size(of: clock)?.width ?? 0)
+    }
+
+    /// Find the clock beneath `element`.
+    ///
+    /// It is a grandchild rather than a child: each of this app's items sits
+    /// inside its own `AXGroup`, and the group carries no identifier and no
+    /// actions. Only the element inside it does.
+    private static func clockElement(under element: AXUIElement, depth: Int) -> AXUIElement? {
+        guard depth <= 3 else { return nil }
+        var identifier: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, "AXIdentifier" as CFString,
+                                         &identifier) == .success,
+           (identifier as? String) == clockAccessibilityIdentifier {
+            return element
+        }
+        var childValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString,
+                                            &childValue) == .success,
+              let children = childValue as? [AXUIElement] else { return nil }
+        for child in children {
+            if let found = clockElement(under: child, depth: depth + 1) { return found }
+        }
+        return nil
+    }
+
+    /// The app behind the Notification Centre panel.
+    private static let notificationCentreBundleIdentifier = "com.apple.notificationcenterui"
+
+    /// Whether the Notification Centre panel is on screen right now.
+    ///
+    /// Matched by the owning process's bundle identifier rather than by the
+    /// window's name. The name is localised — this Mac reports "Notification
+    /// Centre", a US one reports "Notification Center" — and matching on it
+    /// would stop working abroad with no error and no clue why.
+    ///
+    /// Only the owner's process id is read, never the window name, so this does
+    /// not require Screen Recording.
+    static var isNotificationCentreShowing: Bool {
+        guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
+                                                        kCGNullWindowID) as? [[String: Any]] else { return false }
+        return windows.contains { window in
+            guard let pid = window[kCGWindowOwnerPID as String] as? pid_t else { return false }
+            return NSRunningApplication(processIdentifier: pid)?.bundleIdentifier
+                == notificationCentreBundleIdentifier
+        }
+    }
+
+    /// Ask the clock to act on a press, as if it had been clicked.
+    ///
+    /// This is how Notification Centre is opened without posting a synthetic
+    /// mouse event. It is refused while a restriction is active — measured
+    /// 2026-09-20, the call returns success and nothing opens — so the caller
+    /// has to lift the restriction first.
+    ///
+    /// The element is looked up here rather than passed in, so that the lookup
+    /// happens AFTER the restriction has gone. An element found while the bar
+    /// was still restricted describes an item macOS was not drawing.
+    @discardableResult
+    static func pressSystemClock() -> Bool {
+        guard let clock = systemClock() else { return false }
+        AXUIElementSetMessagingTimeout(clock.element, messagingTimeout)
+        return AXUIElementPerformAction(clock.element, kAXPressAction as CFString) == .success
+    }
+
     /// The bundle identifiers of every app that must stay visible when the bar
     /// collapses to a chevron occupying `chevron`.
     ///

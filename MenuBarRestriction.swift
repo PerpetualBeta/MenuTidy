@@ -90,7 +90,17 @@ enum MenuBarRestriction {
 
     private typealias SendNoArgs = @convention(c) (AnyObject, Selector) -> Unmanaged<AnyObject>?
     private typealias SendTwoObjects = @convention(c) (AnyObject, Selector, AnyObject, AnyObject) -> Unmanaged<AnyObject>?
-    private typealias SendObjectAndBlock = @convention(c) (AnyObject, Selector, AnyObject, @convention(block) (NSError?) -> Void) -> Void
+    /// The completion block is `@escaping` on purpose.
+    ///
+    /// `activateWithConfiguration:completionHandler:` answers asynchronously,
+    /// so Objective-C keeps the block and calls it after the call has returned.
+    /// Without `@escaping`, Swift treats it as non-escaping and aborts the
+    /// process the moment it is called: "closure argument passed as @noescape
+    /// to Objective-C has escaped". A closure that captures nothing happens to
+    /// survive that, because it compiles to a global block with no lifetime to
+    /// get wrong, which is why this went unnoticed until a closure here first
+    /// captured a local value.
+    private typealias SendObjectAndBlock = @convention(c) (AnyObject, Selector, AnyObject, @escaping @convention(block) (NSError?) -> Void) -> Void
     private typealias SendVoid = @convention(c) (AnyObject, Selector) -> Void
 
     /// `[[cls alloc] init]` for a class we have no header for.
@@ -144,6 +154,15 @@ enum MenuBarRestriction {
     /// The process currently holding the restriction, if any.
     private static var holder: Process?
 
+    /// The list the current holder was started with.
+    ///
+    /// Kept so the restriction can be dropped and put back identically, which
+    /// is what `withRestrictionLifted(do:)` needs. Rebuilding it from a fresh
+    /// inventory instead would take a different snapshot of a bar that has
+    /// moved on, and the bar would come back subtly different from the one the
+    /// user was looking at.
+    private static var heldAllowList: [String] = []
+
     /// Apply the restriction and stay alive until killed. Never returns.
     ///
     /// Runs in a second copy of this same binary, launched with `holderFlag`.
@@ -156,6 +175,7 @@ enum MenuBarRestriction {
     /// rather than through Launch Services, so it does not register as a second
     /// instance of MenuTidy, shows no icon and owns no menu bar item.
     static func runAsHolder(keeping bundleIdentifiers: [String]) -> Never {
+        let entered = Date()
         guard isAvailable,
               let configurationClass,
               let assertionClass,
@@ -166,12 +186,25 @@ enum MenuBarRestriction {
             exit(1)
         }
         let activate = unsafeBitCast(msgSend, to: SendObjectAndBlock.self)
+        let asked = Date()
         activate(assertion,
                  NSSelectorFromString("activateWithConfiguration:completionHandler:"),
                  configuration) { error in
             if let error {
                 MTDebug.log("holder: activation FAILED: \(error.localizedDescription)")
+                return
             }
+            // How long the bar takes to actually change is the number that
+            // matters to the user: this process has to start, load the private
+            // framework and ask, and only then does macOS reflow the bar. The
+            // parent's own "holder: pid N" line is stamped at launch, so the
+            // gap between the two lines is the visible lag on a collapse.
+            let now = Date()
+            MTDebug.log(String(format:
+                "holder: restriction ACTIVE. %.0f ms setting up, %.0f ms in activate, %.0f ms since this process began running",
+                asked.timeIntervalSince(entered) * 1000,
+                now.timeIntervalSince(asked) * 1000,
+                now.timeIntervalSince(entered) * 1000))
         }
         // Never outlive the app that started us. If MenuTidy crashes rather
         // than terminating us, this process would otherwise hold the menu bar
@@ -207,6 +240,7 @@ enum MenuBarRestriction {
         }
         let previous = holder
         holder = process
+        heldAllowList = bundleIdentifiers
         if let previous, previous.isRunning { previous.terminate() }
         MTDebug.log("holder: pid \(process.processIdentifier) holding \(bundleIdentifiers.count) app(s)")
         return true
@@ -254,7 +288,67 @@ enum MenuBarRestriction {
     }
 
     /// True while a restriction is applied.
-    static var isRestricting: Bool { holder != nil }
+    ///
+    /// Asks whether the holder is actually alive rather than whether one was
+    /// ever started. If the holder dies without being told to — killed by hand,
+    /// or crashed — the bar is unrestricted and every icon is back, and this
+    /// app must not go on believing the bar is collapsed.
+    static var isRestricting: Bool { holder?.isRunning == true }
+
+    /// Drop the restriction, run `action`, then put the restriction straight
+    /// back exactly as it was.
+    ///
+    /// ## Why this has to exist
+    ///
+    /// While a restriction is active, macOS refuses to open Notification
+    /// Centre. Clicking the clock does nothing, and so does asking the clock to
+    /// press itself through Accessibility — measured 2026-09-20: the press
+    /// reports success and nothing opens. Assessment mode is exam lockdown, and
+    /// withholding notifications is one of the things it is for, so there is no
+    /// setting that turns it off. `MBAssessmentModeConfiguration` carries
+    /// exactly two properties, `allowedSystemItems` and
+    /// `allowedBundleIdentifiers`, and neither is about notifications.
+    ///
+    /// The one thing that does work is not being restricted. Measured in the
+    /// same session: the press succeeds the instant the holder process dies,
+    /// with no waiting period at all, and re-applying the restriction
+    /// afterwards does **not** close the panel again.
+    ///
+    /// So the restriction is dropped for the length of one press.
+    ///
+    /// ## What this costs
+    ///
+    /// Every hidden icon is briefly drawn again, because for that moment the
+    /// bar genuinely is not restricted. The gap is one process exit plus one
+    /// process launch.
+    ///
+    /// Nothing here runs on the main thread beyond the first two statements.
+    /// Waiting for a process to exit, and talking to another process over
+    /// Accessibility, are both things that must not happen on the thread that
+    /// draws the menu bar.
+    static func withRestrictionLifted(do action: @escaping () -> Void) {
+        guard let process = holder, process.isRunning else { action(); return }
+        let allowList = heldAllowList
+        holder = nil
+        process.terminate()
+        let lifted = Date()
+        DispatchQueue.global(qos: .userInitiated).async {
+            process.waitUntilExit()
+            let exited = Date()
+            action()
+            let acted = Date()
+            DispatchQueue.main.async {
+                // Not conditional on the action working. The bar is
+                // unrestricted until this runs, so it runs either way.
+                startHolder(keeping: allowList)
+                MTDebug.log(String(format:
+                    "restriction lifted: holder exited after %.0f ms, action took %.0f ms, bar unrestricted for %.0f ms in total",
+                    exited.timeIntervalSince(lifted) * 1000,
+                    acted.timeIntervalSince(exited) * 1000,
+                    Date().timeIntervalSince(lifted) * 1000))
+            }
+        }
+    }
 
     // MARK: - Private
 
