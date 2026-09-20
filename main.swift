@@ -884,13 +884,33 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func warnIfTheBarIsTooFull() {
         guard !hasSaidTheBarIsFull,
               let width = NSScreen.main?.frame.width,
-              let share = MenuBarInventory.occupancy(ofScreenWidth: width),
-              share >= menuBarFullThreshold else { return }
-        hasSaidTheBarIsFull = true
-        MTDebug.log(String(format:
-            "menu bar is %.0f%% full (%.0f pt of %.0f pt), at or past the %.0f%% mark — macOS may start dropping items and leaving dead rectangles",
-            share * 100, share * width, width, menuBarFullThreshold * 100))
-        NotchWarning.show(title: "Menu bar is full", detail: "macOS may hide icons itself")
+              let share = MenuBarInventory.occupancy(ofScreenWidth: width) else { return }
+        let threshold = menuBarFullThreshold
+
+        // Off the main thread: asking whether macOS has added its own chevron
+        // means a round trip to another process, and this runs after every
+        // expand.
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let alreadyHiding = MenuBarInventory.macOSIsHidingItems
+            guard alreadyHiding || share >= threshold else { return }
+            DispatchQueue.main.async {
+                guard let self, !self.hasSaidTheBarIsFull else { return }
+                self.hasSaidTheBarIsFull = true
+                MTDebug.log(String(format:
+                    "menu bar is %.0f%% full (%.0f pt of %.0f pt), threshold %.0f%%; macOS %@ hiding items of its own accord",
+                    share * 100, share * width, width, threshold * 100,
+                    alreadyHiding ? "IS" : "is not"))
+                if alreadyHiding {
+                    // Present tense on purpose. This is not a forecast: icons
+                    // are being dropped right now.
+                    NotchWarning.show(title: "Menu bar is full",
+                                      detail: "macOS is hiding icons itself")
+                } else {
+                    NotchWarning.show(title: "Menu bar is nearly full",
+                                      detail: "macOS may start hiding icons")
+                }
+            }
+        }
     }
 
     /// Whether a click on the clock should be relayed while the bar is

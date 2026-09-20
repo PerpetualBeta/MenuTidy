@@ -262,6 +262,45 @@ enum MenuBarInventory {
         return nil
     }
 
+    /// Whether macOS is hiding menu bar items of its own accord right now.
+    ///
+    /// macOS 27 puts a chevron of its own in the bar when it runs out of room.
+    /// It is an `AXButton` sitting directly in MenuBarAgent's menu bar,
+    /// alongside the two `AXGroup`s that hold Control Centre and the clock, and
+    /// it is there **only** while macOS is hiding something. Measured
+    /// 2026-09-20: absent on a bar with room, present at x=890 w=18 on an
+    /// overfull one, described as "Show Hidden Menu Bar Items".
+    ///
+    /// This is worth far more than guessing from widths, because it is a fact
+    /// rather than a prediction: when this is true, icons are being dropped
+    /// this moment, allow-listed ones included, and each one leaves its
+    /// rectangle behind for clicks to fall into.
+    ///
+    /// Matched on the **role**, not the description. The description is
+    /// English and would quietly stop matching in any other language.
+    static var macOSIsHidingItems: Bool {
+        guard isPermitted,
+              let app = NSWorkspace.shared.runningApplications.first(where: {
+                  $0.bundleIdentifier == clockOwnerBundleIdentifier
+              }) else { return false }
+        let application = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(application, messagingTimeout)
+        var barValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(application, "AXExtrasMenuBar" as CFString,
+                                            &barValue) == .success,
+              let bar = barValue else { return false }
+        var childValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(bar as! AXUIElement, kAXChildrenAttribute as CFString,
+                                            &childValue) == .success,
+              let children = childValue as? [AXUIElement] else { return false }
+        return children.contains { child in
+            var role: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(child, kAXRoleAttribute as CFString,
+                                                &role) == .success else { return false }
+            return (role as? String) == (kAXButtonRole as String)
+        }
+    }
+
     /// The app behind the Notification Centre panel.
     private static let notificationCentreBundleIdentifier = "com.apple.notificationcenterui"
 
@@ -332,9 +371,9 @@ enum MenuBarInventory {
     /// to the left edge would keep whatever sits immediately left of the chevron
     /// every time, which would hide almost nothing.
     static func bundleIdentifiers(leftOf chevron: (x: CGFloat, width: CGFloat)) -> [String] {
-        let divider = chevron.x
+        let divider = chevron.x + chevron.width / 2
         var keep = Set<String>()
-        for item in snapshot where item.x >= divider {
+        for item in snapshot where item.maxX > divider {
             keep.insert(item.bundleIdentifier)
         }
         return Array(keep)
