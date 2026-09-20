@@ -15,29 +15,39 @@ import Sparkle
 enum MTDebug {
     static let enabled = UserDefaults.standard.bool(forKey: "debugLogging")
 
-    private static let handle: FileHandle? = {
-        guard enabled else { return nil }
-        let dir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Logs/MenuTidy", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let url = dir.appendingPathComponent("menutidy.log")
-        // Opened O_APPEND rather than with FileHandle(forWritingTo:) + seek.
-        //
-        // Two processes write to this file: the app and the holder it spawns.
-        // Each FileHandle carries its OWN offset, so with a plain seek-to-end
-        // they both write at the position the file had when they started, and
-        // clobber each other's lines. Measured 2026-09-20: of four holder
-        // start-ups only one left a line, and truncating the file while the app
-        // held it open padded the gap with NUL bytes.
-        //
-        // O_APPEND makes the kernel place every write at the true end of the
-        // file at the moment of the write, whichever process makes it.
-        let descriptor = open(url.path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
-        guard descriptor >= 0 else { return nil }
-        return FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
-    }()
+    private static let directory = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Logs/MenuTidy", isDirectory: true)
+    private static let url = directory.appendingPathComponent("menutidy.log")
+    /// The one generation kept behind the live log.
+    private static let previousURL = directory.appendingPathComponent("menutidy.log.1")
+
+    /// Rotate once the live log passes this many bytes, keeping one previous
+    /// generation, so the most this can ever occupy is twice this figure.
+    ///
+    /// 4 MB by default. A night of the heaviest instrumenting this app has ever
+    /// had, on 2026-09-19, produced 10 MB in about seven hours, so 4 MB holds a
+    /// few hours of the noisiest possible use and the previous generation keeps
+    /// the run before it. Ordinary use with logging on is a small fraction of
+    /// that. It is a knob because a long debugging session may want more:
+    ///
+    ///     defaults write cc.jorviksoftware.MenuTidy debugLogMaxBytes -int 20971520
+    private static var maximumBytes: Int {
+        let stored = UserDefaults.standard.integer(forKey: "debugLogMaxBytes")
+        return stored > 0 ? stored : 4 * 1024 * 1024
+    }
 
     private static let lock = NSLock()
+    private static var handle: FileHandle?
+    /// Which file on disk the handle is actually attached to.
+    ///
+    /// A file handle follows the **inode**, not the path. When one process
+    /// rotates the log, every other process carries on writing into the file
+    /// that was just renamed out of the way, silently, for the rest of its
+    /// life. Two processes write to this log: the app and the holder it spawns.
+    /// So before every write the path is checked against what the handle holds,
+    /// and a mismatch means somebody rotated underneath us and it is time to
+    /// reopen.
+    private static var inode: ino_t = 0
 
     /// Every line is stamped with the time.
     ///
@@ -52,11 +62,72 @@ enum MTDebug {
     }()
 
     static func log(_ message: @autoclosure () -> String) {
-        guard enabled, let handle else { return }
+        guard enabled else { return }
         let line = stamp.string(from: Date()) + "  " + message() + "\n"
         guard let data = line.data(using: .utf8) else { return }
         lock.lock(); defer { lock.unlock() }
+        attachToTheLiveLog()
+        guard let handle else { return }
         handle.write(data)
+        rotateIfTooBig()
+    }
+
+    // MARK: - Private
+
+    /// Make `handle` refer to the file currently at `url`, opening or reopening
+    /// as required. Cheap: one `stat` when nothing has changed, which is the
+    /// usual case.
+    ///
+    /// Opened `O_APPEND` rather than with `FileHandle(forWritingTo:)` + seek.
+    /// Each handle carries its OWN offset, so with a plain seek-to-end two
+    /// processes both write at the position the file had when they started and
+    /// clobber each other. Measured 2026-09-20: of four holder start-ups only
+    /// one left a line, and truncating the file while the app held it open
+    /// padded the gap with NUL bytes. `O_APPEND` makes the kernel place every
+    /// write at the true end at the moment of the write, whoever makes it.
+    private static func attachToTheLiveLog() {
+        var onDisk = stat()
+        let exists = stat(url.path, &onDisk) == 0
+        if handle != nil, exists, onDisk.st_ino == inode { return }
+
+        handle = nil        // closeOnDealloc closes the old descriptor
+        inode = 0
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let descriptor = open(url.path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+        guard descriptor >= 0 else { return }
+        var opened = stat()
+        inode = fstat(descriptor, &opened) == 0 ? opened.st_ino : 0
+        handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+    }
+
+    /// Move the live log aside once it is too big and start a fresh one.
+    ///
+    /// The size is read from the descriptor rather than the path, so it is the
+    /// file being written to that is measured even if the path has since been
+    /// replaced.
+    ///
+    /// If both processes decide to rotate at the same instant, one rename wins
+    /// and the other finds nothing to move; the cost is a single lost
+    /// generation of a log that is off by default. A lock file to close that
+    /// window would be more machinery than the problem deserves, and the holder
+    /// writes about three lines in its whole life.
+    private static func rotateIfTooBig() {
+        guard let handle else { return }
+        var info = stat()
+        guard fstat(handle.fileDescriptor, &info) == 0,
+              info.st_size >= maximumBytes else { return }
+
+        self.handle = nil
+        inode = 0
+        try? FileManager.default.removeItem(at: previousURL)
+        try? FileManager.default.moveItem(at: url, to: previousURL)
+        attachToTheLiveLog()
+
+        // Written straight to the handle: going through log() would take the
+        // lock this method is already holding.
+        let note = stamp.string(from: Date())
+            + "  log rotated at \(info.st_size) bytes — the run before this is in menutidy.log.1\n"
+        if let data = note.data(using: .utf8) { self.handle?.write(data) }
     }
 }
 
