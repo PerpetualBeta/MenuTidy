@@ -42,7 +42,7 @@ enum MTDebug {
 
 // MARK: - App Delegate
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var chevronItem: NSStatusItem!
     /// The invisible spacer that does the hiding on macOS 14-26. Not created
     /// at all on macOS 27, where the bar is one window and an over-wide item
@@ -52,6 +52,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var spacerItem: NSStatusItem?
     var cmdMonitor: Any?
     var mouseMonitor: Any?
+    /// Watches for clicks aimed at the chevron that this app never receives.
+    var buriedChevronMonitor: Any?
+    /// When `statusItemClicked` last ran. The recovery compares against this to
+    /// tell a click that genuinely went missing from one it simply also saw.
+    private var lastHandledClick = Date.distantPast
+    /// True while this app's own menu is on screen.
+    ///
+    /// The click that dismisses a menu is swallowed by the menu, so the status
+    /// item's action never runs for it. If that click happens to land on the
+    /// chevron — and it usually does, because that is what the user just
+    /// right-clicked — the recovery below would see an unhandled click on the
+    /// chevron and wrongly conclude it was buried. Measured 2026-09-20: every
+    /// menu dismissal expanded the bar, and since a recovery deliberately does
+    /// not re-arm auto-collapse, it switched auto-collapse off as well.
+    private var menuIsOpen = false
     var spacerVisible = false
     var revealPanel: HiddenIconsPanel?
     /// Accessibility state, kept current by JorvikKit.
@@ -100,6 +115,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         setupStatusItems()
         setupCmdKeyMonitor()
+        watchForBuriedChevron()
 
         // Pre-warm the hidden-icons cache so opening the reveal panel is
         // instant. Only meaningful on notched displays — gated to avoid
@@ -313,6 +329,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             MTDebug.log("click: handler fired but NSApp.currentEvent was nil — ignoring")
             return
         }
+        lastHandledClick = Date()
         MTDebug.log("click: type=\(event.type.rawValue) collapsed=\(isCollapsed)")
         if event.type == .rightMouseUp {
             showMenu()
@@ -481,8 +498,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        guard let chevronX = chevronItem.button?.window?.frame.minX else {
-            MTDebug.log("collapse skipped: chevron has no window yet")
+        guard let chevron = chevronRect() else {
+            MTDebug.log("collapse skipped: cannot locate the chevron yet")
             isCollapsed = false
             return
         }
@@ -498,8 +515,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         let inventory = MenuBarInventory.snapshot
-        MTDebug.log("collapse: chevronX=\(Int(chevronX)) from \(inventory.count) cached item(s)")
-        var keep = MenuBarInventory.bundleIdentifiers(atOrRightOf: chevronX)
+        MTDebug.log("collapse: chevron=\(Int(chevron.x))-\(Int(chevron.x + chevron.width)) from \(inventory.count) cached item(s)")
+        var keep = MenuBarInventory.bundleIdentifiers(leftOf: chevron)
         if let ownIdentifier = Bundle.main.bundleIdentifier, !keep.contains(ownIdentifier) {
             keep.append(ownIdentifier)
         }
@@ -507,8 +524,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if !MenuBarRestriction.restrict(toVisible: keep) {
             MTDebug.log("collapse failed: the menu bar restriction could not be applied")
             isCollapsed = false
+            return
         }
+
     }
+
 
     func collapse(userInitiated: Bool = true) {
         isCollapsed = true
@@ -583,6 +603,221 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// The chevron's rectangle in screen coordinates.
+    ///
+    /// Everything to the right of this survives a collapse, so a wrong answer
+    /// here does not fail loudly — it quietly keeps the wrong set of icons. A
+    /// reading of 361 instead of 896 kept 23 apps out of 24, which is a collapse
+    /// that hides almost nothing.
+    ///
+    /// **macOS 14 to 26:** the status item owns a real window and its frame is
+    /// the truth. Unchanged.
+    ///
+    /// **macOS 27:** it does not. The whole bar is one Window Server window and
+    /// this app owns nothing at the menu bar layer, confirmed with
+    /// `CGWindowList`. AppKit still returns an `NSWindow`, but its frame is
+    /// stale whenever macOS reflows the bar — which happens every time any app
+    /// with a variable-width item changes width. So ask Accessibility, which
+    /// reports where the item was actually drawn.
+    ///
+    /// Falls back to the window frame when the snapshot has no entry for us yet,
+    /// which is better than refusing to collapse at all.
+    private func chevronRect() -> (x: CGFloat, width: CGFloat)? {
+        if MenuBarRestriction.isAvailable,
+           let ownIdentifier = Bundle.main.bundleIdentifier,
+           let item = MenuBarInventory.item(ofBundleIdentifier: ownIdentifier) {
+            let x = item.x
+            // Log the disagreement, not just the answer. How far the window
+            // frame drifts from where the item was drawn is the only field
+            // evidence we have for how badly macOS 27 reflows behind AppKit's
+            // back, and it costs nothing to record.
+            if let stale = chevronItem.button?.window?.frame.minX, abs(stale - x) >= 1 {
+                MTDebug.log(String(format: "chevron: drawn at %.0f, AppKit window says %.0f (drift %.0f)",
+                                   x, stale, x - stale))
+            }
+            return (x, item.width)
+        }
+        guard let frame = chevronItem.button?.window?.frame else { return nil }
+        return (frame.minX, frame.width)
+    }
+
+    /// Notice when a click on the chevron reaches nothing, and get the user out.
+    ///
+    /// ## The fault this recovers from
+    ///
+    /// macOS 27 hides a menu bar item **without reclaiming its space**: it stops
+    /// being drawn but keeps its rectangle. That is normally invisible. It stops
+    /// being invisible when the bar runs out of room, because macOS then drops
+    /// items of its own accord — including ones this app has explicitly
+    /// allow-listed, since the allow-list grants permission to be visible and
+    /// does not reserve space.
+    ///
+    /// Measured on 2026-09-20. Ballast puts the song title in the bar, so its
+    /// item grows with the track name; it was measured between 36 and 378 points
+    /// wide on the same machine within ten minutes. On a long title the bar
+    /// overflowed, macOS dropped Ballast despite it being allow-listed, and the
+    /// 310-point rectangle it left behind lay across this app's chevron. Clicks
+    /// posted at thirteen positions from x=800 to x=1090 reached **nothing**.
+    /// The same sweep with a short title hit at exactly 1010, 1030 and 1045, the
+    /// chevron's real rectangle.
+    ///
+    /// The chevron is the only way to expand, so this strands the user with a
+    /// collapsed bar and no way back.
+    ///
+    /// ## Why this is detected by click rather than by geometry
+    ///
+    /// The obvious check is "does another item's rectangle cover mine". It does
+    /// not work. Hidden items park in a stack immediately right of the notch,
+    /// and when the chevron is the leftmost visible item it sits in that same
+    /// place — measured at 854-890 with seven parked ghosts at 852-890. A
+    /// geometric test cannot tell that harmless stack from Ballast's dead
+    /// rectangle, and undoes every collapse.
+    ///
+    /// So this asks the question that actually matters: did a click land on the
+    /// chevron and do nothing. A global monitor **never sees events delivered to
+    /// this app**, so a menu bar click that reaches this monitor is by
+    /// definition one this app did not get. If it landed inside the chevron, the
+    /// chevron is buried, and releasing the restriction gives the user their bar
+    /// back.
+    private func watchForBuriedChevron() {
+        guard MenuBarRestriction.isAvailable, buriedChevronMonitor == nil else { return }
+        MTDebug.log("watching for clicks that miss the chevron")
+        buriedChevronMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseUp, .rightMouseUp]
+        ) { [weak self] event in
+            guard let self, self.pointerInMenuBar() else { return }
+            // Read the menu state HERE, not in the completion below: the probe
+            // takes a few hundred milliseconds and the menu will have closed by
+            // then, so asking later always answers "no menu".
+            guard !self.menuIsOpen else { return }
+            self.checkWhetherClickMissedTheChevron(at: NSEvent.mouseLocation.x,
+                                                   wasRightButton: event.type == .rightMouseUp,
+                                                   clickedAt: Date())
+        }
+    }
+
+    /// Was `x` inside the chevron. If so the click was aimed at us and went
+    /// somewhere else, which only happens when the chevron is buried.
+    ///
+    /// Read live rather than from the cache: the whole point is that the bar has
+    /// reflowed since the collapse. The walk is off the main thread and only
+    /// runs on a menu bar click that this app did not receive, so it is rare.
+    private func checkWhetherClickMissedTheChevron(at x: CGFloat,
+                                                   wasRightButton: Bool,
+                                                   clickedAt: Date) {
+        guard let ownIdentifier = Bundle.main.bundleIdentifier else { return }
+
+        // Wait for the normal path before doing ANY work. A global monitor DOES
+        // see clicks on a status item even when this app receives them too — the
+        // system draws the bar, so the event reaches the global stream either
+        // way. So most of what arrives here was handled perfectly well a
+        // moment ago and needs nothing.
+        //
+        // Deciding that cheaply matters. An earlier cut walked Accessibility
+        // first and checked afterwards, which put a walk on the path of every
+        // single menu bar click, including the click that starts a collapse.
+        // That walk queries this app's own process too, and an Accessibility
+        // query against ourselves has to be served by our main thread — the same
+        // thread trying to perform the collapse. The collapse visibly lagged.
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.clickHandOverWindow) {
+            // Re-check the menu here, not only at the monitor, and throw away a
+            // click that has gone stale.
+            //
+            // An open NSMenu stops this app's main run loop dead for as long as
+            // it is on screen — not slows, stops. Measured 2026-09-20 with a
+            // replica of showMenu(): a block scheduled 0.03s before a menu
+            // opened ran 2.7s late in one run and **28.1 seconds** late in
+            // another, in both cases the instant the menu closed. Heartbeat
+            // timers froze for the same interval.
+            //
+            // So without this, a click can be judged here long after the user
+            // made it, and several queued clicks fire in one burst when the menu
+            // closes — collapsing or expanding the bar for no reason the user
+            // can see.
+            guard !self.menuIsOpen,
+                  Date().timeIntervalSince(clickedAt) < Self.staleClickCutoff else { return }
+
+            // Near in time, in EITHER direction. The monitor and the status
+            // item's own action both fire on mouse-up and their order is not
+            // guaranteed. An earlier cut tested `lastHandledClick < clickedAt`,
+            // so whenever the monitor happened to be timestamped later the
+            // guard passed and the recovery collapsed a bar the user had just
+            // expanded — appearing as auto-collapse firing instantly.
+            guard abs(clickedAt.timeIntervalSince(self.lastHandledClick))
+                    >= Self.clickHandOverWindow else { return }
+            self.walkToConfirmTheClickMissed(at: x, wasRightButton: wasRightButton,
+                                             ownIdentifier: ownIdentifier)
+        }
+    }
+
+    /// How long to give the ordinary click path before treating a click as lost.
+    ///
+    /// This is the gap between the button going up and `statusItemClicked`
+    /// running, which is a few milliseconds when it happens at all. A quarter of
+    /// a second is far longer than that and still far shorter than a person can
+    /// notice, and nothing happens during the wait.
+    private static let clickHandOverWindow: TimeInterval = 0.25
+
+    /// Past this age a click is not worth acting on.
+    ///
+    /// Only reachable when the main run loop has been stalled, which an open
+    /// menu does for its whole lifetime. Acting on a click this old means acting
+    /// on an intention the user abandoned long ago.
+    private static let staleClickCutoff: TimeInterval = 1.0
+
+    private func walkToConfirmTheClickMissed(at x: CGFloat, wasRightButton: Bool,
+                                             ownIdentifier: String) {
+        MenuBarInventory.probe { live in
+            guard let mine = live.first(where: { $0.bundleIdentifier == ownIdentifier }),
+                  x >= mine.x, x <= mine.maxX else { return }
+            MTDebug.log(String(format:
+                "chevron is buried: a %@-click at %.0f fell inside it (%.0f-%.0f) and never arrived. Acting on it here.",
+                wasRightButton ? "right" : "left", x, mine.x, mine.maxX))
+            if wasRightButton {
+                // The menu is what the click asked for, so give them the menu,
+                // at the pointer rather than via the button. Expanding instead
+                // would be a surprise, and would hide the very thing they were
+                // reaching for.
+                self.showMenu(at: NSEvent.mouseLocation)
+            } else if !self.isCollapsed {
+                // A missed LEFT click while EXPANDED is deliberately ignored.
+                //
+                // Recovering it would mean collapsing, and a wrong collapse is
+                // destructive: it hides the user's icons and they may not even
+                // realise the state changed. A wrong menu is merely a menu.
+                //
+                // It has to be ignored because our own position cannot be
+                // trusted in this state. Measured 2026-09-20: within two log
+                // lines, a live probe put this app's item at 856-892 while the
+                // collapse that followed put it at 1008-1044. On an overfull
+                // expanded bar our own item can be sitting on a ghost rectangle
+                // like any other. A click at 884 was matched to the chevron,
+                // was not aimed at it, and collapsed the bar under the user.
+                //
+                // Collapsed is different: the bar is not overfull, positions
+                // agree, and the recovery's action is to EXPAND, which shows
+                // more rather than less and is instantly obvious if wrong.
+                MTDebug.log(String(format:
+                    "missed left-click at %.0f ignored: expanded, so our own position is not trustworthy", x))
+            } else {
+                // Auto-collapse is left ARMED here, deliberately.
+                //
+                // An earlier cut suppressed it, reasoning that re-collapsing
+                // would just bury the chevron again. That was the wrong trade:
+                // burials are frequent when a long title is playing, so every
+                // one of them silently switched off a feature the user had
+                // turned on, and it looked like auto-collapse was broken.
+                //
+                // It is also no longer necessary. Burial used to be a trap
+                // because the chevron was the only way back and it had stopped
+                // answering. It is survivable now — that is what this whole
+                // recovery is — so honour the setting and let the user turn it
+                // off themselves if they would rather.
+                self.expand()
+            }
+        }
+    }
+
     // MARK: Menu
 
     func showMenu() {
@@ -591,10 +826,43 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // (which dismisses the panel), so revealHiddenIcons() can toggle it off.
         revealPanelWasOpenAtMenuInvoke = (revealPanel?.isVisible == true)
         let menu = buildMenu()
+        menu.delegate = self
         chevronItem.menu = menu
         chevronItem.button?.performClick(nil)
         DispatchQueue.main.async { [weak self] in
             self?.chevronItem.menu = nil
+        }
+    }
+
+    /// Open the menu at a point on screen, without going through the status
+    /// item's button.
+    ///
+    /// `showMenu()` asks the button to click itself, which is the right thing to
+    /// do when the bar is behaving. It is the wrong thing when the click had to
+    /// be recovered, because the reason it needed recovering is that the button
+    /// is not where macOS is drawing the item. Measured on 2026-09-20: with the
+    /// bar expanded and overfull, the chevron was reported at x=250 — spilled to
+    /// the **left** of the notch — seconds after a click at x=1065 was matched
+    /// to it. `performClick` on that button logged success and showed nothing.
+    ///
+    /// Popping the menu at the pointer needs no button and no correct item
+    /// position, so it works in exactly the case that defeats the normal path.
+    func showMenu(at point: NSPoint) {
+        MTDebug.log(String(format: "showMenu: popping the menu at %.0f,%.0f", point.x, point.y))
+        revealPanelWasOpenAtMenuInvoke = (revealPanel?.isVisible == true)
+        let menu = buildMenu()
+        menu.delegate = self
+        menu.popUp(positioning: nil, at: point, in: nil)
+    }
+
+    func menuWillOpen(_ menu: NSMenu) { menuIsOpen = true }
+
+    /// Cleared a beat late on purpose. The click that dismisses a menu arrives
+    /// while the menu is still closing, so clearing this synchronously would
+    /// reopen the very window the flag exists to close.
+    func menuDidClose(_ menu: NSMenu) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            self?.menuIsOpen = false
         }
     }
 
@@ -1488,6 +1756,33 @@ final class HiddenIconRow: NSView {
 }
 
 // MARK: - Main
+
+// Holder mode. Started by our own `collapse()` as a separate process, never by
+// the user. It applies the restriction, then does nothing but stay alive.
+//
+// Why a second process rather than just calling invalidate(): **invalidate()
+// does not undo assessment mode.** Proven 2026-09-20 on 27.0 (26A428) by
+// controlled experiment — a process that has never restricted leaves
+// Notification Centre working; one collapse and expand kills it and it stays
+// dead while expanded, unrestricted, for the life of the process. Only the
+// process exiting restores it. Wi-Fi and Control Centre are unaffected
+// throughout, which is what identifies the residue as assessment mode's own
+// notification suppression rather than anything geometric.
+//
+// The framework offers no other inverse: `dyld_info -exports` shows
+// MBAssessmentModeAssertion has exactly activate(completionHandler:),
+// activate(with:completionHandler:) and invalidate(). So the only complete
+// release available is process death, and this makes that a thing MenuTidy can
+// do on demand instead of something that needs the user to quit the app.
+//
+// Verified end to end with a standalone build of exactly this code path: no
+// restriction, clock works; assertion held in a separate process, clock dead;
+// that process killed, clock works again.
+if let holderIndex = CommandLine.arguments.firstIndex(of: MenuBarRestriction.holderFlag) {
+    let keep = Array(CommandLine.arguments.dropFirst(holderIndex + 1))
+    MenuBarRestriction.runAsHolder(keeping: keep)
+    // runAsHolder never returns.
+}
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)

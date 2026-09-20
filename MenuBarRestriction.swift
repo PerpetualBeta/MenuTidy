@@ -103,10 +103,6 @@ enum MenuBarRestriction {
 
     // MARK: - State
 
-    /// The live restriction, if one is applied. Held so it can be swapped or
-    /// dropped; releasing it is what puts the icons back.
-    private static var assertion: AnyObject?
-
     /// Apple's own menu bar owners, always kept whatever the user's layout.
     ///
     /// `allowedSystemItems` keeps the clock and Control Centre *drawn*, but that
@@ -140,6 +136,90 @@ enum MenuBarRestriction {
 
     // MARK: - Applying
 
+    // MARK: - The holder process
+
+    /// Argument that puts a MenuTidy process into holder mode.
+    static let holderFlag = "--hold-menu-bar-restriction"
+
+    /// The process currently holding the restriction, if any.
+    private static var holder: Process?
+
+    /// Apply the restriction and stay alive until killed. Never returns.
+    ///
+    /// Runs in a second copy of this same binary, launched with `holderFlag`.
+    /// Using our own executable rather than a separate helper target means no
+    /// new build product, no extra signing rule and no change to the shared
+    /// release pipeline — the holder inherits the app's own signature and
+    /// notarisation because it IS the app.
+    ///
+    /// It deliberately never creates an NSApplication. It is spawned directly
+    /// rather than through Launch Services, so it does not register as a second
+    /// instance of MenuTidy, shows no icon and owns no menu bar item.
+    static func runAsHolder(keeping bundleIdentifiers: [String]) -> Never {
+        guard isAvailable,
+              let configurationClass,
+              let assertionClass,
+              let msgSend,
+              let configuration = makeInstanceOfConfiguration(configurationClass,
+                                                              bundles: bundleIdentifiers),
+              let assertion = makeInstance(of: assertionClass) else {
+            exit(1)
+        }
+        let activate = unsafeBitCast(msgSend, to: SendObjectAndBlock.self)
+        activate(assertion,
+                 NSSelectorFromString("activateWithConfiguration:completionHandler:"),
+                 configuration) { error in
+            if let error {
+                MTDebug.log("holder: activation FAILED: \(error.localizedDescription)")
+            }
+        }
+        // Never outlive the app that started us. If MenuTidy crashes rather
+        // than terminating us, this process would otherwise hold the menu bar
+        // restricted forever with nothing left to release it. Once our parent
+        // dies we are reparented to launchd (pid 1), which is the signal.
+        let parentWatch = Timer(timeInterval: 2.0, repeats: true) { _ in
+            if getppid() == 1 { exit(0) }
+        }
+        RunLoop.main.add(parentWatch, forMode: .common)
+
+        // Held for the life of this process. No invalidate() on the way out:
+        // it is not the undo, and exiting is.
+        withExtendedLifetime(assertion) { RunLoop.main.run() }
+        exit(0)
+    }
+
+    /// Start a holder for `bundleIdentifiers`, replacing any existing one.
+    ///
+    /// The new holder is started BEFORE the old one is killed, so the bar never
+    /// flashes back to its unrestricted state in between — the same ordering the
+    /// in-process path used.
+    @discardableResult
+    private static func startHolder(keeping bundleIdentifiers: [String]) -> Bool {
+        guard let executable = Bundle.main.executableURL else { return false }
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = [holderFlag] + bundleIdentifiers
+        do {
+            try process.run()
+        } catch {
+            MTDebug.log("holder: could not start: \(error.localizedDescription)")
+            return false
+        }
+        let previous = holder
+        holder = process
+        if let previous, previous.isRunning { previous.terminate() }
+        MTDebug.log("holder: pid \(process.processIdentifier) holding \(bundleIdentifiers.count) app(s)")
+        return true
+    }
+
+    /// Kill the holder. This is the complete release.
+    private static func stopHolder() {
+        guard let process = holder else { return }
+        holder = nil
+        if process.isRunning { process.terminate() }
+        MTDebug.log("holder: pid \(process.processIdentifier) terminated — restriction fully released")
+    }
+
     /// Restrict the menu bar to `bundleIdentifiers`, hiding every other
     /// third-party item. The clock and Control Centre are always kept.
     ///
@@ -154,43 +234,27 @@ enum MenuBarRestriction {
         for identifier in alwaysAllowedBundleIdentifiers where !bundleIdentifiers.contains(identifier) {
             bundleIdentifiers.append(identifier)
         }
-        guard isAvailable,
-              let configurationClass,
-              let assertionClass,
-              let msgSend else { return false }
-
-        guard let configuration = makeInstanceOfConfiguration(configurationClass,
-                                                             bundles: bundleIdentifiers),
-              let newAssertion = makeInstance(of: assertionClass) else { return false }
-
-        let activate = unsafeBitCast(msgSend, to: SendObjectAndBlock.self)
-        activate(newAssertion,
-                 NSSelectorFromString("activateWithConfiguration:completionHandler:"),
-                 configuration) { error in
-            if let error {
-                MTDebug.log("menu bar restriction FAILED: \(error.localizedDescription)")
-            } else {
-                MTDebug.log("menu bar restriction activated ok")
-            }
+        guard isAvailable else { return false }
+        let started = startHolder(keeping: bundleIdentifiers)
+        if started {
+            MTDebug.log("menu bar restricted, keeping: \(bundleIdentifiers.sorted().joined(separator: ", "))")
         }
-
-        let previous = assertion
-        assertion = newAssertion
-        if let previous { invalidate(previous) }   // after, so there is no gap
-        MTDebug.log("menu bar restricted, keeping: \(bundleIdentifiers.sorted().joined(separator: ", "))")
-        return true
+        return started
     }
 
-    /// Drop any restriction and let every item come back.
+    /// Drop the restriction and let every item come back.
+    ///
+    /// Killing the holder, not invalidating an assertion. See `runAsHolder` for
+    /// why: invalidate() is not the undo, and leaves Notification Centre dead
+    /// for the life of whichever process called activate.
     static func release() {
-        guard let current = assertion else { return }
-        assertion = nil
-        invalidate(current)
+        guard holder != nil else { return }
+        stopHolder()
         MTDebug.log("menu bar restriction released")
     }
 
     /// True while a restriction is applied.
-    static var isRestricting: Bool { assertion != nil }
+    static var isRestricting: Bool { holder != nil }
 
     // MARK: - Private
 
@@ -203,11 +267,5 @@ enum MenuBarRestriction {
                         NSSelectorFromString("initWithAllowedSystemItems:allowedBundleIdentifiers:"),
                         allSystemItemIdentifiers as NSArray,
                         bundles as NSArray)?.takeRetainedValue()
-    }
-
-    private static func invalidate(_ object: AnyObject) {
-        guard let msgSend else { return }
-        let send = unsafeBitCast(msgSend, to: SendVoid.self)
-        send(object, NSSelectorFromString("invalidate"))
     }
 }

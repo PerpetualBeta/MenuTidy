@@ -41,6 +41,13 @@ enum MenuBarInventory {
         let appName: String
         /// Left edge in global screen coordinates.
         let x: CGFloat
+        /// How wide the item is. Most are about 36 points, but an item showing
+        /// text is not: Ballast puts the song title in the bar and was measured
+        /// at 378 points on one track. Width is what decides whether an item
+        /// straddles the chevron, so it cannot be inferred.
+        let width: CGFloat
+        /// Right edge in global screen coordinates.
+        var maxX: CGFloat { x + width }
     }
 
     /// Whether Accessibility is granted. Without it the walk returns nothing,
@@ -111,15 +118,103 @@ enum MenuBarInventory {
         }
     }
 
-    /// The bundle identifiers of every app with an item at or right of `x`.
+    /// One app's leftmost item, or nil if it owns none in the snapshot.
     ///
-    /// This is the allow-list for a collapse: everything from the chevron
-    /// rightwards stays, everything left of it goes. An app owning items on
-    /// both sides is kept, because the restriction works per app and hiding it
-    /// would take away an icon the user asked to keep.
-    static func bundleIdentifiers(atOrRightOf x: CGFloat) -> [String] {
+    /// Used to locate MenuTidy's own chevron. `NSStatusItem`'s button reports a
+    /// window frame, and before macOS 27 that was the truth. It is not on 27:
+    /// `CGWindowList` shows MenuTidy owns **no window at the menu bar layer at
+    /// all**, because the bar is one Window Server window. AppKit still hands
+    /// back an `NSWindow`, but its frame is wherever AppKit last put it rather
+    /// than where macOS drew the item after its own reflow. Measured on
+    /// 2026-09-20: the window said x=361 while Accessibility and a screenshot
+    /// of the pixels both said x=896.
+    ///
+    /// Reflows are frequent when any app has a variable-width item. Ballast puts
+    /// the song title in the bar, and one track change moved this app's chevron
+    /// 126 points in a single step.
+    ///
+    /// **This is the cached snapshot, so it can still be stale**: it refreshes on
+    /// expand and at launch, not on every reflow. It is wrong less often than the
+    /// window frame, which is wrong by hundreds of points, but it is not live.
+    static func item(ofBundleIdentifier bundleIdentifier: String) -> Item? {
+        snapshot.filter { $0.bundleIdentifier == bundleIdentifier }.min { $0.x < $1.x }
+    }
+
+    /// Walk the bar now and hand back what is there, **without touching the
+    /// cached snapshot**.
+    ///
+    /// The cache is deliberately only taken while the bar is expanded, because a
+    /// restricted bar under-reports and caching that would shrink the allow-list
+    /// a little further every cycle. But there is one question that can only be
+    /// answered while collapsed: is this app's own chevron still reachable, or
+    /// has a hidden item's leftover rectangle landed on top of it. So this reads
+    /// without writing.
+    /// Shares `refresh()`'s one-at-a-time guard. Without it a burst of clicks
+    /// queues a sweep each, and they run back to back on the work queue long
+    /// after the clicks that asked for them.
+    ///
+    /// It also logs. An earlier cut was silent, which meant the interesting
+    /// case — a click that went missing — left no trace at all, and the log read
+    /// as if nothing had happened.
+    static func probe(completion: @escaping ([Item]) -> Void) {
+        guard isPermitted else { completion([]); return }
+
+        let alreadyRunning = stateLock.sync { () -> Bool in
+            if _walkInFlight { return true }
+            _walkInFlight = true
+            return false
+        }
+        if alreadyRunning {
+            MTDebug.log("probe skipped: a walk is already in flight")
+            completion([])
+            return
+        }
+
+        let candidates = candidateApps()
+        workQueue.async {
+            let started = Date()
+            let (items, _) = walk(candidates)
+            stateLock.sync { _walkInFlight = false }
+            MTDebug.log(String(format: "probe: %d app(s) in %.1fs -> %d item(s)",
+                               candidates.count, Date().timeIntervalSince(started), items.count))
+            DispatchQueue.main.async { completion(items) }
+        }
+    }
+
+    /// The bundle identifiers of every app that must stay visible when the bar
+    /// collapses to a chevron occupying `chevron`.
+    ///
+    /// Everything from the chevron rightwards stays, everything left of it goes.
+    /// An app owning items on both sides is kept, because the restriction works
+    /// per app and hiding it would take away an icon the user asked to keep.
+    ///
+    /// ## An item that straddles the chevron counts as being on both sides
+    ///
+    /// The test is the item's **right edge against the middle of the chevron**,
+    /// not its left edge against the left of the chevron. An item is hidden only
+    /// when it lies wholly to the left.
+    ///
+    /// This is not tidiness. macOS 27 hides an item **without reclaiming its
+    /// space**: the item stops being drawn but keeps its rectangle, leaving a
+    /// dead hole in the bar. Measured on 2026-09-20 with Ballast, which puts the
+    /// song title in the bar. On a long title its item ran from 870 to 1074
+    /// while the chevron sat at 1046. Judged by its left edge alone the item is
+    /// "left of the chevron", so it was hidden, and its 204-point hole then lay
+    /// across the chevron. **A click anywhere in that hole reaches nothing.**
+    /// Verified by posting clicks at thirteen positions from x=800 to x=1090:
+    /// not one of them reached this app, while the same sweep with a short title
+    /// hit at exactly 1010, 1030 and 1045, the chevron's real rectangle.
+    ///
+    /// The user's only way back is the chevron, so burying it strands them.
+    ///
+    /// The midpoint is used rather than the chevron's left edge because
+    /// neighbouring items in a packed bar overlap by a point or two. Measuring
+    /// to the left edge would keep whatever sits immediately left of the chevron
+    /// every time, which would hide almost nothing.
+    static func bundleIdentifiers(leftOf chevron: (x: CGFloat, width: CGFloat)) -> [String] {
+        let divider = chevron.x
         var keep = Set<String>()
-        for item in snapshot where item.x >= x {
+        for item in snapshot where item.x >= divider {
             keep.insert(item.bundleIdentifier)
         }
         return Array(keep)
@@ -184,7 +279,8 @@ enum MenuBarInventory {
                 guard let origin = position(of: child), origin.x >= 0 else { continue }
                 mine.append(Item(bundleIdentifier: bundleIdentifier,
                                  appName: app.localizedName ?? bundleIdentifier,
-                                 x: origin.x))
+                                 x: origin.x,
+                                 width: size(of: child)?.width ?? 0))
             }
             resultLock.lock(); perApp[index] = (mine, app.processIdentifier); resultLock.unlock()
         }
@@ -196,6 +292,16 @@ enum MenuBarInventory {
             if let pid { hosts.insert(pid) }
         }
         return (items.sorted { $0.x < $1.x }, hosts)
+    }
+
+    private static func size(of element: AXUIElement) -> CGSize? {
+        AXUIElementSetMessagingTimeout(element, messagingTimeout)
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &value) == .success,
+              let raw = value else { return nil }
+        var size = CGSize.zero
+        guard AXValueGetValue(raw as! AXValue, .cgSize, &size) else { return nil }
+        return size
     }
 
     private static func position(of element: AXUIElement) -> CGPoint? {
