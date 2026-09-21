@@ -13,7 +13,15 @@ import Sparkle
 // never to /tmp. Used to dump hidden-icon AX geometry when diagnosing reveal
 // counts; the flag-read is cached once so the hot detection loop stays cheap.
 enum MTDebug {
-    static let enabled = UserDefaults.standard.bool(forKey: "debugLogging")
+    /// Read on every call, not cached at launch, so `defaults write ...
+    /// debugLogging -bool YES` takes effect without a relaunch. That is what
+    /// every other logging app in the estate does (see `Ballast/Sources/Log.swift`),
+    /// and there is no hot path here to protect: the busiest log site sits
+    /// inside `evaluateAutoCollapse`, behind branches that only fire on a state
+    /// change, which a full day of use showed firing 165 times rather than once
+    /// per pointer move. `log()` takes its message as an `@autoclosure`, so a
+    /// disabled call still builds no string.
+    static var enabled: Bool { UserDefaults.standard.bool(forKey: "debugLogging") }
 
     private static let directory = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Logs/MenuTidy", isDirectory: true)
@@ -145,6 +153,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var mouseMonitor: Any?
     /// Watches for clicks aimed at the chevron that this app never receives.
     var buriedChevronMonitor: Any?
+    /// Instrument state for `watchTheChevronPosition`. Main thread only.
+    var chevronWatchTimer: Timer?
+    var lastWatchedChevronX: CGFloat?
     /// When `statusItemClicked` last ran. The recovery compares against this to
     /// tell a click that genuinely went missing from one it simply also saw.
     private var lastHandledClick = Date.distantPast
@@ -209,6 +220,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setupStatusItems()
         setupCmdKeyMonitor()
         watchForBuriedChevron()
+        watchTheChevronPosition()
 
         // Pre-warm the hidden-icons cache so opening the reveal panel is
         // instant. Only meaningful on notched displays — gated to avoid
@@ -620,6 +632,188 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
+        logTheBarAsItWasRead(inventory, chevron: chevron, keep: keep)
+        logAllowListedAppsInUnusualLocations(keep)
+        verifyTheCollapseKeptWhatItPromised(keep, before: inventory)
+    }
+
+    /// How often the chevron watcher reads this app's own icon position.
+    private static let chevronWatchInterval: TimeInterval = 1.0
+
+    /// Watch where this app's own icon is actually drawn, and log every move.
+    ///
+    /// Behind its own knob, because it is an instrument and not a feature:
+    ///
+    ///     defaults write cc.jorviksoftware.MenuTidy logChevronMoves -bool YES
+    ///
+    /// **What this replaced, and why.** The first version measured how long
+    /// macOS takes to put the bar back after the restriction is released, on
+    /// the theory that `expand()` re-walks about 20 ms later and might be
+    /// photographing a bar still in its collapsed layout. **That theory is
+    /// dead.** Nine expand cycles on 2026-09-21, sixty readings each at 50 ms
+    /// intervals: the first reading landed 1 to 4 ms after the release and the
+    /// position never changed once, in any cycle. The snapshot agreed with the
+    /// live reading and with AppKit's window frame every time. There is no
+    /// settling to wait for, so do not add a delay.
+    ///
+    /// What the numbers pointed at instead: at 16:17:54 the chevron read 1714
+    /// having read 2012 three minutes earlier, inside one app session, with
+    /// AppKit agreeing at both readings. So this app read the bar correctly and
+    /// **the bar had genuinely moved this app's icon 298 points**, about eight
+    /// slots, while the user was editing the macOS menu bar visibility list.
+    /// That changes which icons fall on which side of the chevron without the
+    /// user touching the chevron.
+    ///
+    /// So the question is no longer "why was the photograph wrong". It is "what
+    /// moves this icon". A one-second poll catches that with a timestamp, and
+    /// logs only changes, so a quiet day costs one line.
+    ///
+    /// The read is dispatched off the main thread: asking Accessibility about
+    /// our own process needs our own main thread free to answer it.
+    private func watchTheChevronPosition() {
+        guard MTDebug.enabled,
+              UserDefaults.standard.bool(forKey: "logChevronMoves") else { return }
+        let pid = ProcessInfo.processInfo.processIdentifier
+        chevronWatchTimer = Timer.scheduledTimer(withTimeInterval: AppDelegate.chevronWatchInterval,
+                                                 repeats: true) { [weak self] _ in
+            DispatchQueue.global(qos: .utility).async {
+                guard let x = MenuBarInventory.liveLeftmostItemX(ofProcessIdentifier: pid) else { return }
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    defer { self.lastWatchedChevronX = x }
+                    guard let previous = self.lastWatchedChevronX else {
+                        MTDebug.log(String(format: "chevron watch: starting at x=%.0f", x))
+                        return
+                    }
+                    guard x != previous else { return }
+                    MTDebug.log(String(format: "chevron watch: moved %.0f -> %.0f (%+.0f), collapsed=%@",
+                                       previous, x, x - previous,
+                                       self.isCollapsed ? "true" : "false"))
+                }
+            }
+        }
+    }
+
+    /// Dump the layout the collapse decision was actually made from.
+    ///
+    /// Every wrong collapse so far has been a wrong **input**, not a wrong
+    /// rule. The rule is one comparison: keep anything whose right edge is past
+    /// the middle of the chevron. What has gone wrong is the chevron position,
+    /// or a snapshot missing an app, or a snapshot describing a layout the bar
+    /// has already moved on from.
+    ///
+    /// Until this existed the log recorded the answer and never the question,
+    /// so "that icon should have been hidden" could only be argued about. Now
+    /// it can be read off: the divider, how old the reading is, and every item
+    /// with its edges and the side it fell on.
+    ///
+    /// Behind the debug flag. It is a dozen or so lines per collapse.
+    private func logTheBarAsItWasRead(_ inventory: [MenuBarInventory.Item],
+                                      chevron: (x: CGFloat, width: CGFloat),
+                                      keep: [String]) {
+        guard MTDebug.enabled else { return }
+        let divider = chevron.x + chevron.width / 2
+        let age = MenuBarInventory.snapshotAge.map { String(format: "%.1fs old", $0) } ?? "age unknown"
+        MTDebug.log("bar as read: chevron=\(Int(chevron.x))-\(Int(chevron.x + chevron.width)) "
+                    + "divider=\(Int(divider)), \(inventory.count) item(s), snapshot \(age)")
+        let keeping = Set(keep)
+        for item in inventory.sorted(by: { $0.x < $1.x }) {
+            let side = item.maxX > divider ? "keep" : "HIDE"
+            let asked = keeping.contains(item.bundleIdentifier) ? "" : "  (not in allow-list)"
+            MTDebug.log("  \(side)  \(Int(item.x))-\(Int(item.maxX))  \(item.bundleIdentifier)\(asked)")
+        }
+    }
+
+    /// Record any allow-listed app that is not installed straight into
+    /// `/Applications`.
+    ///
+    /// Assessment mode matches on bundle identifier, and on macOS 27
+    /// `MenuBarAgent` resolves that identifier from **where the app lives**.
+    /// For an app launched from outside `/Applications` it hands assessment
+    /// mode a **nil** identifier, and nil matches nothing in any allow-list, so
+    /// the system takes that icon down along with the ones that were genuinely
+    /// asked for. Whichever side of the chevron it was on.
+    ///
+    /// Settled in Pelmet [issue #30](https://github.com/fif7y/pelmet/issues/30)
+    /// by a reporter's symlink test: iStat Menus 7 runs its menu bar helper
+    /// from `~/Library/Application Support/iStat Menus 7/`, the agent read nil,
+    /// and symlinking that path to a copy in `/Applications` made the agent
+    /// resolve the real path and read `com.bjango.istatmenus.status` correctly.
+    /// The icon came back. This app builds its allow-list from bundle
+    /// identifiers too, so it behaves identically and cannot fix it either.
+    ///
+    /// **Not reproducible on this machine**: every menu bar app here runs from
+    /// `/Applications` or `/System`. So this does not fix anything and does not
+    /// claim the case is happening. It puts the one fact that separates it from
+    /// every other cause into the log, so the next "my icons vanished" can be
+    /// answered from evidence rather than a guess, and pointed at the symlink.
+    ///
+    /// The test is the **parent directory**, not a prefix. `/Applications/Foo.app`
+    /// is the resolving case; a nested install such as `/Applications/Setapp/Foo.app`
+    /// is not known to resolve and a prefix test would wave it through.
+    ///
+    /// Only the unusual case is logged. An ordinary bar says nothing here.
+    private func logAllowListedAppsInUnusualLocations(_ keep: [String]) {
+        guard MTDebug.enabled else { return }
+        let running = NSWorkspace.shared.runningApplications
+        let unusual = keep.sorted().compactMap { identifier -> String? in
+            guard let url = running.first(where: { $0.bundleIdentifier == identifier })?.bundleURL
+            else { return nil }
+            let parent = url.deletingLastPathComponent().path
+            guard parent != "/Applications", parent != "/System", !parent.hasPrefix("/System/")
+            else { return nil }
+            return "\(identifier) at \(url.path)"
+        }
+        guard !unusual.isEmpty else { return }
+        MTDebug.log("allow-list: \(unusual.count) app(s) are not installed directly in /Applications, "
+                    + "which macOS 27 may drop whichever side of the chevron they are on: "
+                    + unusual.joined(separator: "; "))
+    }
+
+    /// Check that the collapse kept what it said it would keep.
+    ///
+    /// Being in the allow-list is permission to be visible. **It does not
+    /// reserve space.** macOS drops items of its own accord when the bar is
+    /// overfull, allow-listed ones included, and an app whose bundle
+    /// identifier the system reads as nil can never be matched at all. Both
+    /// look identical to the user: an icon that was to the right of the chevron
+    /// and is now gone. Neither left any trace in this log.
+    ///
+    /// So: which apps owned an item before the collapse, were asked to keep it,
+    /// and own none afterwards. Named, so the next report starts with an answer.
+    ///
+    /// **Read the silence correctly.** An item macOS merely stops drawing stays
+    /// in the Accessibility tree at the position it would have had, so this
+    /// cannot see it. What it catches is an item that was **destroyed**, which
+    /// is the failure worth a name. A quiet log here does not prove every icon
+    /// is on screen.
+    ///
+    /// Behind the debug flag, because it costs one extra Accessibility sweep
+    /// per collapse. `probe` reads without writing, so it cannot poison the
+    /// cached snapshot the way a `refresh` during a collapse would.
+    ///
+    /// One interaction to know about while debugging: `probe` and `refresh`
+    /// share a one-at-a-time token, so an expand landing inside this probe's
+    /// half-second window has its own refresh dropped. Only reachable with
+    /// debug logging on, and only for a double click on the chevron, but it
+    /// would look like a snapshot that failed to update for no reason.
+    private func verifyTheCollapseKeptWhatItPromised(_ keep: [String], before: [MenuBarInventory.Item]) {
+        guard MTDebug.enabled else { return }
+        // Long enough for macOS to finish reflowing the bar. The restriction
+        // itself reports ACTIVE within about 10 ms; the reflow after it has
+        // never been measured, so this is a generous round number chosen for an
+        // instrument rather than a tuned figure for behaviour.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self, self.isCollapsed else { return }
+            MenuBarInventory.probe { after in
+                let owned = Set(before.map { $0.bundleIdentifier })
+                let survived = Set(after.map { $0.bundleIdentifier })
+                let lost = Set(keep).intersection(owned).subtracting(survived).sorted()
+                guard !lost.isEmpty else { return }
+                MTDebug.log("collapse check: \(lost.count) allow-listed app(s) left the bar anyway: "
+                            + lost.joined(separator: ", "))
+            }
+        }
     }
 
 

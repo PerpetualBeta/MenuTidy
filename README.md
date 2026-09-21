@@ -245,6 +245,43 @@ On **macOS 14 to 26**, make sure the icons you want hidden are to the **left** o
 
 On **macOS 27**, check two things. Icons you want hidden must be to the **left of the chevron**. And Accessibility must be granted — without it MenuTidy cannot tell which icons to keep, so it refuses to collapse rather than risk hiding everything. Clicking the chevron will say so and offer to open the right settings pane.
 
+### An icon disappeared that should have stayed (macOS 27)
+
+Icons to the **right** of the chevron are meant to stay visible when the bar
+collapses. If one of them vanishes instead, there are two known causes and the
+log will tell you which.
+
+Turn the log on, collapse the bar once, then read
+`~/Library/Logs/MenuTidy/menutidy.log`:
+
+```bash
+defaults write cc.jorviksoftware.MenuTidy debugLogging -bool YES
+```
+
+It takes effect immediately, with no relaunch.
+
+Each collapse writes out the layout it decided from: every icon, where it starts
+and ends, and whether it was kept or hidden. Two lines are worth looking for.
+
+`allow-list: N app(s) are not installed directly in /Applications` names an app
+macOS 27 cannot match. The system works out an icon's owner from where the app
+lives, and for an app launched from anywhere other than `/Applications` it
+reports no owner at all, so no allow-list can keep it and the icon is taken down
+whichever side of the chevron it sits on. This is not something MenuTidy can fix.
+The workaround is to install the app in `/Applications`, or to symlink its
+location to a copy there.
+
+`collapse check: N allow-listed app(s) left the bar anyway` names an app that was
+asked for and went regardless. That usually means the bar is too full and macOS
+is dropping icons of its own accord, which it does even to icons an app has
+asked it to keep.
+
+Turn the log off again with:
+
+```bash
+defaults write cc.jorviksoftware.MenuTidy debugLogging -bool NO
+```
+
 ### The spacer isn't visible
 
 The spacer is only visible when you hold the `command` key. In normal use it's completely invisible.

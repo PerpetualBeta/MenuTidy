@@ -20,12 +20,30 @@ import ApplicationServices
 /// So the walk happens on a background queue and the result is kept. Callers
 /// read the snapshot, which costs nothing.
 ///
-/// Two things make the refresh far cheaper after the first one:
+/// ## Fast sweeps, and why they are not enough on their own
 ///
-/// - Only processes known to own a status item are asked. Most running apps
-///   never have one, and `AXExtrasMenuBar` on those is a wasted round trip.
-///   The same trick `HiddenIcons` already uses for its own cache.
-/// - A refresh is triggered by app launches and quits rather than by a timer.
+/// Most running apps never own a status item, so `AXExtrasMenuBar` on those is
+/// a wasted round trip. A **fast** sweep therefore asks only the process ids
+/// already known to own one. That is the same trick `HiddenIcons` uses.
+///
+/// The catch, and it went unnoticed from 2.2.0 to 2.3.0: that set is built from
+/// **process ids**, and it is replaced wholesale by every sweep. An app that
+/// restarts has a new id the set has never heard of. An app that was merely
+/// busy and missed the messaging timeout answered nothing, which used to be
+/// recorded as "owns no status item". Either way it fell out of the set, and
+/// `candidateApps` never asks a process that is not in the set, so it could
+/// never come back.
+///
+/// **That is not a cosmetic cache miss.** An app missing from the snapshot is
+/// missing from the allow-list, and an app missing from the allow-list is
+/// hidden by the restriction *whichever side of the chevron it sits on*.
+/// Measured on 2026-09-21: a fast sweep asked 23 apps and found 17 items while
+/// a full sweep 49 seconds later asked 190 and found 21.
+///
+/// Two things stop it now. A busy app keeps whatever standing it had rather
+/// than being dropped (see `refresh`), and a fast sweep is promoted to a
+/// **full** one whenever the fast set can no longer be trusted to be complete
+/// (see `effectiveScope`).
 ///
 /// ## Why the snapshot is taken while EXPANDED
 ///
@@ -73,10 +91,26 @@ enum MenuBarInventory {
     private static let workQueue = DispatchQueue(label: "cc.jorviksoftware.MenuTidy.inventory.work",
                                                  qos: .utility)
 
+    /// How wide a sweep to take.
+    enum Scope {
+        /// Ask only the processes already known to own a status item.
+        case fast
+        /// Ask every running application.
+        case full
+    }
+
     private static var _snapshot: [Item] = []
     private static var _knownHostPIDs: Set<pid_t> = []
     private static var _haveWalkedOnce = false
     private static var _walkInFlight = false
+    /// When the last full sweep finished, and which processes were running at
+    /// the time. Together they decide whether the fast set is still complete.
+    /// When the live snapshot was taken. A collapse decision is only as good
+    /// as this is fresh, and the bar reflows on its own, so the age belongs in
+    /// the log next to the decision.
+    private static var _snapshotAt: Date?
+    private static var _lastFullSweepAt: Date?
+    private static var _lastFullSweepAppPIDs: Set<pid_t> = []
 
     /// The most recent inventory. Instant; never walks, never waits on one.
     static var snapshot: [Item] { stateLock.sync { _snapshot } }
@@ -84,8 +118,17 @@ enum MenuBarInventory {
     /// Whether a usable snapshot has been taken yet.
     static var hasSnapshot: Bool { stateLock.sync { !_snapshot.isEmpty } }
 
+    /// How long ago the live snapshot was taken, or nil if there is none.
+    static var snapshotAge: TimeInterval? {
+        stateLock.sync { _snapshotAt }.map { Date().timeIntervalSince($0) }
+    }
+
     /// Refresh in the background. Cheap to call often.
-    static func refresh(completion: (() -> Void)? = nil) {
+    ///
+    /// `scope` is a floor, not a ceiling: a `.fast` request is promoted to a
+    /// full sweep whenever the fast set can no longer be trusted. See
+    /// `effectiveScope`.
+    static func refresh(scope requested: Scope = .fast, completion: (() -> Void)? = nil) {
         guard isPermitted else { completion?(); return }
 
         // One walk at a time. Several clicks in a row would otherwise queue up
@@ -97,20 +140,47 @@ enum MenuBarInventory {
         }
         if alreadyRunning { completion?(); return }
 
-        let candidates = candidateApps()
+        // Enumerated once and handed to both, rather than asked for twice on
+        // the calling thread.
+        let running = NSWorkspace.shared.runningApplications
+        let scope = effectiveScope(requested: requested, running: running)
+        let candidates = candidateApps(scope: scope, running: running)
+        let knownBefore = stateLock.sync { _knownHostPIDs }
         workQueue.async {
             let started = Date()
-            let (items, hosts) = walk(candidates)
-            MTDebug.log(String(format: "inventory walk: %d app(s) in %.1fs -> %d item(s)",
+            let (items, hosts, unreachable) = walk(candidates)
+            MTDebug.log(String(format: "inventory walk (%@): %d app(s) in %.1fs -> %d item(s)",
+                               scope == .full ? "full" : "fast",
                                candidates.count, Date().timeIntervalSince(started), items.count))
+            if scope == .full, !knownBefore.isEmpty {
+                // The whole reason the full sweep exists. Any host recovered
+                // here was missing from the fast set, which means it was
+                // missing from the last allow-list, which means the last
+                // collapse hid it whichever side of the chevron it was on.
+                // Silent until this line existed.
+                let names = hosts.subtracting(knownBefore)
+                    .compactMap { NSRunningApplication(processIdentifier: $0)?.bundleIdentifier }
+                if !names.isEmpty {
+                    MTDebug.log("inventory: full sweep recovered \(names.count) host(s) the fast set had lost: "
+                                + names.sorted().joined(separator: ", "))
+                }
+            }
             stateLock.sync {
                 // A walk that finds nothing is far more likely to be a wedged AX
                 // call than a genuinely empty menu bar, so keep the previous
                 // snapshot rather than replacing it with nothing.
                 if !items.isEmpty {
                     _snapshot = items
-                    _knownHostPIDs = hosts
+                    _snapshotAt = Date()
+                    // An app that could not be reached keeps whatever standing
+                    // it had. Dropping it was permanent, because a process that
+                    // is not in this set is never asked again.
+                    _knownHostPIDs = hosts.union(_knownHostPIDs.intersection(unreachable))
                     _haveWalkedOnce = true
+                    if scope == .full {
+                        _lastFullSweepAt = Date()
+                        _lastFullSweepAppPIDs = Set(candidates.map { $0.processIdentifier })
+                    }
                 }
                 _walkInFlight = false
             }
@@ -170,10 +240,10 @@ enum MenuBarInventory {
             return
         }
 
-        let candidates = candidateApps()
+        let candidates = candidateApps(scope: .fast, running: NSWorkspace.shared.runningApplications)
         workQueue.async {
             let started = Date()
-            let (items, _) = walk(candidates)
+            let (items, _, _) = walk(candidates)
             stateLock.sync { _walkInFlight = false }
             MTDebug.log(String(format: "probe: %d app(s) in %.1fs -> %d item(s)",
                                candidates.count, Date().timeIntervalSince(started), items.count))
@@ -237,6 +307,33 @@ enum MenuBarInventory {
               let clock = clockElement(under: bar as! AXUIElement, depth: 0),
               let origin = position(of: clock) else { return nil }
         return (clock, origin.x, size(of: clock)?.width ?? 0)
+    }
+
+    /// Where one process's leftmost status item is drawn, read **live**.
+    ///
+    /// One Accessibility round trip to one process, the same shape as
+    /// `systemClock()` and measured there at under 30 ms. Takes a process id
+    /// rather than a bundle identifier so a caller sampling in a loop does not
+    /// re-enumerate every running app each time.
+    ///
+    /// **Call this off the main thread.** Asking Accessibility about our own
+    /// process needs our own main thread free to answer, so a main-thread call
+    /// about ourselves waits out the messaging timeout and returns nothing.
+    static func liveLeftmostItemX(ofProcessIdentifier pid: pid_t) -> CGFloat? {
+        guard isPermitted else { return nil }
+        let application = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(application, messagingTimeout)
+        var barValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(application, "AXExtrasMenuBar" as CFString,
+                                            &barValue) == .success,
+              let bar = barValue else { return nil }
+        var childValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(bar as! AXUIElement, kAXChildrenAttribute as CFString,
+                                            &childValue) == .success,
+              let children = childValue as? [AXUIElement] else { return nil }
+        // Same rule as the walk: a negative x is an item that is not laid out
+        // in the bar at the moment, not a position.
+        return children.compactMap { position(of: $0)?.x }.filter { $0 >= 0 }.min()
     }
 
     /// Find the clock beneath `element`.
@@ -381,15 +478,55 @@ enum MenuBarInventory {
 
     // MARK: - Private
 
-    /// After the first walk, only ask processes already known to own an item.
-    /// Anything launched since is included too, so a newly started menu bar app
-    /// is picked up on the next refresh.
-    private static func candidateApps() -> [NSRunningApplication] {
-        let all = NSWorkspace.shared.runningApplications
+    /// A full sweep asks every running app. A fast one asks only the processes
+    /// already known to own a status item.
+    private static func candidateApps(scope: Scope,
+                                      running all: [NSRunningApplication]) -> [NSRunningApplication] {
+        guard scope == .fast else { return all }
         let (known, walked) = stateLock.sync { (_knownHostPIDs, _haveWalkedOnce) }
         guard walked else { return all }
-        return all.filter { known.contains($0.processIdentifier) || $0.launchDate.map { $0 > Date().addingTimeInterval(-300) } ?? false }
+        return all.filter { known.contains($0.processIdentifier) }
     }
+
+    /// Promote a fast sweep to a full one when the fast set can no longer be
+    /// trusted to be complete.
+    ///
+    /// This replaces a five-minute `launchDate` window that only half worked.
+    /// That window caught an app during the five minutes after it started and
+    /// never again, so an app that restarted while the bar sat collapsed, or
+    /// that surfaced its status item late, stayed invisible for the rest of the
+    /// session.
+    ///
+    /// Two triggers, both cheap:
+    ///
+    /// - **The set of running processes has changed** since the last full
+    ///   sweep. The fast set is keyed by process id, so anything started, quit
+    ///   or restarted makes it incomplete by definition. This is exact rather
+    ///   than a guess at a timeout.
+    /// - **The last full sweep has aged out.** A process list that has not
+    ///   changed is not proof the bar has not: some apps create their status
+    ///   item long after they launch.
+    private static func effectiveScope(requested: Scope,
+                                       running: [NSRunningApplication]) -> Scope {
+        guard requested == .fast else { return .full }
+        let (walked, sweptAt, sweptPIDs) = stateLock.sync {
+            (_haveWalkedOnce, _lastFullSweepAt, _lastFullSweepAppPIDs)
+        }
+        guard walked, let sweptAt else { return .full }
+        if Date().timeIntervalSince(sweptAt) >= fullSweepMaxAge { return .full }
+        return Set(running.map { $0.processIdentifier }) == sweptPIDs ? .fast : .full
+    }
+
+    /// How stale a full sweep may get before the next refresh is promoted to
+    /// one, in seconds.
+    ///
+    /// A full sweep was measured at **1.1 seconds** across 190 running apps on
+    /// 2026-09-21, on a background queue, with the messaging timeout below
+    /// doing the heavy lifting. One a minute is a small fraction of one core's
+    /// background time, and it bounds how long an app that created its status
+    /// item late can stay missing from the allow-list. Missing from the
+    /// allow-list means hidden on the next collapse, so the bound is the point.
+    private static let fullSweepMaxAge: TimeInterval = 60
 
     /// How long to wait on any one app before giving up on it.
     ///
@@ -401,14 +538,20 @@ enum MenuBarInventory {
     /// that time is not one whose icons we can place anyway.
     private static let messagingTimeout: Float = 0.25
 
-    private static func walk(_ apps: [NSRunningApplication]) -> ([Item], Set<pid_t>) {
+    /// Ask each app what status items it owns.
+    ///
+    /// Returns the items, the process ids that **answered**, and the process
+    /// ids that **could not be reached**. The third one matters: "no reply" and
+    /// "no menu bar items" used to be the same answer here, and conflating them
+    /// dropped a merely busy app out of the fast set for good.
+    private static func walk(_ apps: [NSRunningApplication]) -> ([Item], Set<pid_t>, Set<pid_t>) {
         let targets = apps.filter { $0.bundleIdentifier != nil && $0.processIdentifier > 0 }
 
         // Walked concurrently as well as with a timeout. The work is almost
         // entirely waiting on other processes, so doing them one at a time means
         // the sweep costs the SUM of every app's latency rather than the worst
         // of them.
-        var perApp = [([Item], pid_t?)](repeating: ([], nil), count: targets.count)
+        var perApp = [([Item], pid_t?, Bool)](repeating: ([], nil, false), count: targets.count)
         let resultLock = NSLock()
 
         DispatchQueue.concurrentPerform(iterations: targets.count) { index in
@@ -418,15 +561,27 @@ enum MenuBarInventory {
             AXUIElementSetMessagingTimeout(element, messagingTimeout)
 
             var barValue: CFTypeRef?
-            guard AXUIElementCopyAttributeValue(element, "AXExtrasMenuBar" as CFString, &barValue) == .success,
-                  let bar = barValue else { return }
+            let barResult = AXUIElementCopyAttributeValue(element, "AXExtrasMenuBar" as CFString, &barValue)
+            guard barResult == .success, let bar = barValue else {
+                // `.cannotComplete` is what the messaging timeout above returns
+                // for an app that was busy or wedged. It is NOT the same
+                // statement as "this app has no status items", and treating the
+                // two alike is what removed a busy app from the allow-list for
+                // the rest of the session. Every other error is a settled
+                // answer: the app has no extras menu bar, or no Accessibility
+                // support at all.
+                if barResult == .cannotComplete {
+                    resultLock.lock(); perApp[index] = ([], nil, true); resultLock.unlock()
+                }
+                return
+            }
 
             var childValue: CFTypeRef?
             guard AXUIElementCopyAttributeValue(bar as! AXUIElement,
                                                 kAXChildrenAttribute as CFString,
                                                 &childValue) == .success,
                   let children = childValue as? [AXUIElement] else {
-                resultLock.lock(); perApp[index] = ([], app.processIdentifier); resultLock.unlock()
+                resultLock.lock(); perApp[index] = ([], app.processIdentifier, false); resultLock.unlock()
                 return
             }
 
@@ -441,16 +596,19 @@ enum MenuBarInventory {
                                  x: origin.x,
                                  width: size(of: child)?.width ?? 0))
             }
-            resultLock.lock(); perApp[index] = (mine, app.processIdentifier); resultLock.unlock()
+            resultLock.lock(); perApp[index] = (mine, app.processIdentifier, false); resultLock.unlock()
         }
 
         var items: [Item] = []
         var hosts = Set<pid_t>()
-        for (found, pid) in perApp {
+        var unreachable = Set<pid_t>()
+        for (index, entry) in perApp.enumerated() {
+            let (found, pid, couldNotBeReached) = entry
             items.append(contentsOf: found)
             if let pid { hosts.insert(pid) }
+            if couldNotBeReached { unreachable.insert(targets[index].processIdentifier) }
         }
-        return (items.sorted { $0.x < $1.x }, hosts)
+        return (items.sorted { $0.x < $1.x }, hosts, unreachable)
     }
 
     private static func size(of element: AXUIElement) -> CGSize? {
