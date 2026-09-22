@@ -54,16 +54,21 @@ After installation, launch MenuTidy — a chevron icon (`»`) appears in your me
 
 ## How It Works
 
-There are two mechanisms, because macOS 27 changed the menu bar.
+There are two mechanisms, because macOS 27 changed the menu bar. The difference that matters is **who does the hiding**.
 
-**On macOS 14 to 26**, MenuTidy adds two elements: a **chevron** (the visible icon you click) and a **spacer** (an invisible divider). When collapsed, the spacer expands to push icons to its left out of view.
+- **macOS 14 to 26 — MenuTidy hides your icons.** It pushes them off the edge of the screen itself. Nothing else is involved.
+- **macOS 27 and later — macOS hides your icons.** MenuTidy cannot hide anything at all. It hands the system a list of what to keep, and the system hides the rest and reflows the bar.
+
+That one change is behind everything below that carries a version tag: what can go wrong, whose fault it is, and what you can do about it.
+
+**On macOS 14 to 26**, MenuTidy adds two elements: a **chevron** (the visible icon you click) and a **spacer** (an invisible divider). When collapsed, the spacer expands to push icons to its left out of view. The **spacer** is the boundary, and the chevron sits to the right of your visible icons:
 
 ```
 Expanded:   [hidden icons] | [visible icons] [chevron] [system icons]
 Collapsed:                   [visible icons] [chevron] [system icons]
 ```
 
-**On macOS 27**, the whole menu bar is a single window, so there is nothing for a spacer to push. There is no spacer at all. MenuTidy instead tells macOS which icons should stay and the system hides the rest and reflows the bar itself. The **chevron is the boundary**: everything to its left is hidden, everything to its right stays.
+**On macOS 27**, the whole menu bar is a single window, so there is nothing for a spacer to push. There is no spacer at all. MenuTidy instead tells macOS which icons should stay and the system hides the rest and reflows the bar itself. The **chevron is the boundary**: everything to its left is hidden, everything to its right stays. Note that the chevron has changed places compared with the diagram above, because it is now the divider rather than a button sitting beside one:
 
 An icon wide enough to straddle the chevron is kept. Hiding it would leave its rectangle sitting on top of the chevron, and macOS does not reclaim the space an icon occupied when it stops drawing it, so the chevron would become unclickable. Icons that show text, such as a music player showing the track title, are the ones wide enough for this to matter.
 
@@ -79,22 +84,33 @@ Collapsed:                 [chevron] [visible icons] [system icons]
 
 On first launch, MenuTidy starts in the **expanded** state so you can arrange your icons.
 
-> On **macOS 27** there is no spacer, so ignore the `command`-drag instructions below. Drag icons in the menu bar the ordinary way (`command`-drag, as macOS itself allows) and put the ones you want kept to the **right of the chevron**.
+### On macOS 27 and later
 
-### Choosing which icons to hide
+The **chevron is the boundary**. Everything to its left is hidden when you collapse, and everything to its right stays visible.
+
+Arrange the bar the way macOS itself allows: hold `command` and drag an icon along the menu bar. Put the ones you want kept to the **right** of the chevron, and the ones you are happy to tuck away to the **left**. There is no spacer to find and nothing of MenuTidy's to drag.
+
+MenuTidy needs Accessibility permission on this version, because working out which icons sit to the left of the chevron is the whole of how it builds the list it hands to macOS. It asks the first time you collapse, and it refuses to collapse without it rather than risk hiding every icon on the Mac.
+
+<details>
+<summary><strong>On macOS 14 to 26</strong> — arranging icons around the spacer</summary>
+
+**Choosing which icons to hide**
 
 All icons to the **left** of the spacer will be hidden when collapsed. All icons to the **right** of the spacer will remain visible at all times.
 
 To move an icon between the hidden and visible zones:
 
-1. Hold `command` (Command) — a glowing blue bar will appear in your menu bar showing where the spacer is
+1. Hold `command` — a glowing blue bar will appear in your menu bar showing where the spacer is
 2. While holding `command`, drag any menu bar icon to the **right** of the blue bar to keep it always visible
 3. Drag icons to the **left** of the blue bar to include them in the collapsible group
 4. Release `command` — the blue bar disappears
 
-### Repositioning the spacer
+**Repositioning the spacer**
 
 You can also move the spacer itself. Hold `command` and drag the glowing blue bar left or right to change where the hidden/visible boundary sits.
+
+</details>
 
 ## Day-to-Day Use
 
@@ -174,7 +190,7 @@ Each time you open the panel it scans the menu bar fresh — a brief spinner sho
 
 The menu item only appears on notched displays. The first time you use it MenuTidy will ask for Accessibility permission so it can enumerate other apps' status items; you can also grant it ahead of time from **Settings → Permissions**.
 
-#### Where the notch actually ends
+### Where the notch actually ends
 
 macOS reports the notch's right edge through `auxiliaryTopRightArea`, but it does not start drawing status items there — there is a dead band of roughly 14 to 30 points beyond it where an item is laid out, reports a perfectly ordinary position, and is never rendered. Nothing in AppKit describes that band, and a probe status item doesn't find it either (it measures the leftmost *available slot* for the current arrangement, which is a different thing).
 
@@ -186,7 +202,7 @@ defaults write cc.jorviksoftware.MenuTidy notchDrawInset -float 24
 
 Default is 22. **Err low if you change it** — too small only reverts to missing the odd icon from the list, while too large starts hiding icons that are plainly on screen.
 
-### Settings…
+## Settings…
 
 - **Auto-collapse** — automatically collapse the bar a few seconds after the pointer leaves it (0–999 seconds; 0 = immediately). Off by default; see below
 - **Permissions → Accessibility** — on macOS 14 to 26, required only for **Reveal Hidden Icons**. **On macOS 27 it is required for collapsing to work at all**, because MenuTidy has to work out which icons sit left of the chevron. The row says which applies, and shows live status with a Grant Access button
@@ -229,7 +245,9 @@ open.build/MenuTidy.app
 
 ### The chevron disappeared
 
-If you accidentally move the chevron to the left of the spacer and collapse, MenuTidy will detect this and automatically expand to recover. If the chevron is still missing, quit MenuTidy from Activity Monitor and relaunch — it will start expanded.
+On **macOS 14 to 26** this happens if you move the chevron to the left of the spacer and then collapse. MenuTidy detects it and expands again by itself to recover.
+
+If the chevron is still missing, on any version, quit MenuTidy from Activity Monitor and relaunch — it will start expanded.
 
 To fully reset MenuTidy's saved positions:
 
@@ -248,10 +266,22 @@ On **macOS 27**, check two things. Icons you want hidden must be to the **left o
 ### An icon disappeared that should have stayed (macOS 27)
 
 Icons to the **right** of the chevron are meant to stay visible when the bar
-collapses. If one of them vanishes instead, there are two known causes and the
-log will tell you which.
+collapses. If one of them vanishes instead, there are two known causes.
 
-Turn the log on, collapse the bar once, then read
+**MenuTidy tells you about the first one itself.** If an app is installed
+anywhere other than `/Applications`, macOS cannot work out who owns its icon, so
+no allow-list can keep it. A pill drops from the top of the screen naming the
+app, once per launch:
+
+> **iStat Menus cannot be kept**
+> macOS needs it in /Applications
+
+Move that app into `/Applications`, or symlink its location to a copy there, and
+the icon comes back. This is not something MenuTidy can fix from its side: the
+identifier macOS reads is already empty before MenuTidy is asked anything.
+
+For the second cause, and for the exact paths behind the first, turn the log on,
+collapse the bar once, then read
 `~/Library/Logs/MenuTidy/menutidy.log`:
 
 ```bash
@@ -282,11 +312,14 @@ Turn the log off again with:
 defaults write cc.jorviksoftware.MenuTidy debugLogging -bool NO
 ```
 
-### The spacer isn't visible
+<details>
+<summary><strong>The spacer isn't visible</strong> — macOS 14 to 26</summary>
 
 The spacer is only visible when you hold the `command` key. In normal use it's completely invisible.
 
-There is no spacer at all on **macOS 27** — the chevron is the boundary instead.
+There is no spacer at all on **macOS 27 and later**. The chevron is the boundary instead, so there is nothing to reveal.
+
+</details>
 
 ---
 
