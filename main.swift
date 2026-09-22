@@ -155,6 +155,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var buriedChevronMonitor: Any?
     /// Instrument state for `watchTheChevronPosition`. Main thread only.
     var chevronWatchTimer: Timer?
+    /// Kept so the chevron watcher can follow `logChevronMoves` being written
+    /// while the app runs. See `updateChevronWatcher()`.
+    var defaultsObserver: NSObjectProtocol?
     var lastWatchedChevronX: CGFloat?
     /// When `statusItemClicked` last ran. The recovery compares against this to
     /// tell a click that genuinely went missing from one it simply also saw.
@@ -171,6 +174,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var menuIsOpen = false
     /// Said once per run. See `warnIfTheBarIsTooFull()`.
     private var hasSaidTheBarIsFull = false
+    /// Said once per run. See `warnIfAnAppCannotBeKept(_:)`.
+    private var hasSaidAnAppCannotBeKept = false
     var spacerVisible = false
     var revealPanel: HiddenIconsPanel?
     /// Accessibility state, kept current by JorvikKit.
@@ -220,7 +225,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setupStatusItems()
         setupCmdKeyMonitor()
         watchForBuriedChevron()
-        watchTheChevronPosition()
+        updateChevronWatcher()
+        // `logChevronMoves` used to be read once here, so writing the key did
+        // nothing until the next launch while `debugLogging` applied straight
+        // away. MenuTidy is not sandboxed, so an outside `defaults write` does
+        // reach this process as a change notification, which is enough to start
+        // and stop the watcher without paying for a timer while it is off.
+        defaultsObserver = NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification,
+            object: nil,
+            queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.updateChevronWatcher() }
+            }
 
         // Pre-warm the hidden-icons cache so opening the reveal panel is
         // instant. Only meaningful on notched displays — gated to avoid
@@ -633,7 +649,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         logTheBarAsItWasRead(inventory, chevron: chevron, keep: keep)
-        logAllowListedAppsInUnusualLocations(keep)
+        let unkeepable = allowListedAppsMacOSCannotKeep(keep)
+        logAllowListedAppsInUnusualLocations(unkeepable)
+        warnIfAnAppCannotBeKept(unkeepable)
         verifyTheCollapseKeptWhatItPromised(keep, before: inventory)
     }
 
@@ -670,9 +688,30 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     ///
     /// The read is dispatched off the main thread: asking Accessibility about
     /// our own process needs our own main thread free to answer it.
+    /// Start or stop the watcher so it matches the two flags, whenever either
+    /// of them changes.
+    ///
+    /// The flags are read here rather than at wiring time. Reading them once at
+    /// launch meant `logChevronMoves` needed a relaunch to take effect while
+    /// `debugLogging` applied immediately, which is the sort of inconsistency
+    /// that gets diagnosed as "the instrument is broken". Found 2026-09-21 by
+    /// setting the key and watching nothing happen.
+    ///
+    /// Reconciling rather than simply leaving a timer running: the watcher
+    /// polls once a second, and an accessory app that is idle most of the day
+    /// should not be waking up for an instrument nobody switched on.
+    private func updateChevronWatcher() {
+        let wanted = MTDebug.enabled && UserDefaults.standard.bool(forKey: "logChevronMoves")
+        if wanted {
+            if chevronWatchTimer == nil { watchTheChevronPosition() }
+        } else {
+            chevronWatchTimer?.invalidate()
+            chevronWatchTimer = nil
+            lastWatchedChevronX = nil
+        }
+    }
+
     private func watchTheChevronPosition() {
-        guard MTDebug.enabled,
-              UserDefaults.standard.bool(forKey: "logChevronMoves") else { return }
         let pid = ProcessInfo.processInfo.processIdentifier
         chevronWatchTimer = Timer.scheduledTimer(withTimeInterval: AppDelegate.chevronWatchInterval,
                                                  repeats: true) { [weak self] _ in
@@ -724,7 +763,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// Record any allow-listed app that is not installed straight into
+    /// An allow-listed app that macOS 27 will destroy the icon of, because of
+    /// where the app is installed.
+    ///
+    /// Carries the display name as well as the identifier. The identifier is
+    /// the right thing for a log line and the wrong thing for a pill that hangs
+    /// from the notch for five seconds: nobody recognises their menu bar by
+    /// `com.bjango.istatmenus.status`.
+    private struct UnkeepableApp {
+        let identifier: String
+        let url: URL
+        var displayName: String { url.deletingPathExtension().lastPathComponent }
+    }
+
+    /// Find any allow-listed app that is not installed straight into
     /// `/Applications`.
     ///
     /// Assessment mode matches on bundle identifier, and on macOS 27
@@ -742,32 +794,87 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// The icon came back. This app builds its allow-list from bundle
     /// identifiers too, so it behaves identically and cannot fix it either.
     ///
-    /// **Not reproducible on this machine**: every menu bar app here runs from
-    /// `/Applications` or `/System`. So this does not fix anything and does not
-    /// claim the case is happening. It puts the one fact that separates it from
-    /// every other cause into the log, so the next "my icons vanished" can be
-    /// answered from evidence rather than a guess, and pointed at the symlink.
+    /// **Confirmed on someone else's Mac 2026-09-22**, which is why this is no
+    /// longer only a log line. Issue #5's reporter had two icons hidden while
+    /// collapsed; one was an app installed outside `/Applications`, and moving
+    /// it brought the icon back. The app had already detected that and written
+    /// it to a debug log nobody turns on before they have a problem, so the
+    /// only reason the answer was ever found is that a maintainer read a
+    /// screenshot. `warnIfAnAppCannotBeKept(_:)` is the fix for that.
+    ///
+    /// **Still not reproducible on this machine**: every menu bar app here runs
+    /// from `/Applications` or `/System`.
     ///
     /// The test is the **parent directory**, not a prefix. `/Applications/Foo.app`
     /// is the resolving case; a nested install such as `/Applications/Setapp/Foo.app`
     /// is not known to resolve and a prefix test would wave it through.
     ///
-    /// Only the unusual case is logged. An ordinary bar says nothing here.
-    private func logAllowListedAppsInUnusualLocations(_ keep: [String]) {
-        guard MTDebug.enabled else { return }
-        let running = NSWorkspace.shared.runningApplications
-        let unusual = keep.sorted().compactMap { identifier -> String? in
-            guard let url = running.first(where: { $0.bundleIdentifier == identifier })?.bundleURL
-            else { return nil }
+    /// This app's own identifier is in `keep`, so MenuTidy running from outside
+    /// `/Applications` reports itself. That is deliberate and it is the most
+    /// useful case of all: the chevron is the icon that goes, and an app that
+    /// cannot draw its own chevron looks broken rather than restricted.
+    private func allowListedAppsMacOSCannotKeep(_ keep: [String]) -> [UnkeepableApp] {
+        // One pass over the running apps, rather than a scan of them per
+        // allow-list entry. This used to run only behind the debug flag and now
+        // runs on every collapse, so the shape of it starts to matter: roughly
+        // 190 processes against roughly 20 allow-list entries.
+        var bundleURLs: [String: URL] = [:]
+        for app in NSWorkspace.shared.runningApplications {
+            guard let identifier = app.bundleIdentifier, let url = app.bundleURL else { continue }
+            bundleURLs[identifier] = url
+        }
+        return keep.sorted().compactMap { identifier -> UnkeepableApp? in
+            guard let url = bundleURLs[identifier] else { return nil }
             let parent = url.deletingLastPathComponent().path
             guard parent != "/Applications", parent != "/System", !parent.hasPrefix("/System/")
             else { return nil }
-            return "\(identifier) at \(url.path)"
+            return UnkeepableApp(identifier: identifier, url: url)
         }
-        guard !unusual.isEmpty else { return }
-        MTDebug.log("allow-list: \(unusual.count) app(s) are not installed directly in /Applications, "
+    }
+
+    /// Put the paths in the log, where a bug report can quote them.
+    ///
+    /// Only the unusual case is logged. An ordinary bar says nothing here.
+    private func logAllowListedAppsInUnusualLocations(_ unkeepable: [UnkeepableApp]) {
+        guard MTDebug.enabled, !unkeepable.isEmpty else { return }
+        let named = unkeepable.map { "\($0.identifier) at \($0.url.path)" }
+        MTDebug.log("allow-list: \(named.count) app(s) are not installed directly in /Applications, "
                     + "which macOS 27 may drop whichever side of the chevron they are on: "
-                    + unusual.joined(separator: "; "))
+                    + named.joined(separator: "; "))
+    }
+
+    /// Tell the user an icon is about to vanish, and that it is not this app
+    /// doing it.
+    ///
+    /// ## Why a pill rather than a better fix
+    ///
+    /// There is no better fix. The identifier macOS reads is nil before
+    /// MenuTidy is consulted, so no allow-list can name the app. The only
+    /// remedy is to move or symlink the app into `/Applications`, and that is
+    /// the user's to apply. Pelmet reached the same conclusion and shows a
+    /// dimmed tile for the same reason.
+    ///
+    /// ## Said once per run
+    ///
+    /// Exactly as `warnIfTheBarIsTooFull()` is, and for the same reason: this
+    /// is something to learn once, not to be nagged about on every collapse.
+    ///
+    /// ## The wording is short because the pill cannot wrap
+    ///
+    /// `NotchWarningPanel` sizes itself to the drawn width of the two strings,
+    /// so a sentence makes a pill the width of the screen. The name of the app
+    /// and the word `/Applications` are the two things that make the next step
+    /// obvious; the README carries the explanation.
+    private func warnIfAnAppCannotBeKept(_ unkeepable: [UnkeepableApp]) {
+        guard !hasSaidAnAppCannotBeKept, let first = unkeepable.first else { return }
+        hasSaidAnAppCannotBeKept = true
+        if unkeepable.count == 1 {
+            NotchWarning.show(title: "\(first.displayName) cannot be kept",
+                              detail: "macOS needs it in /Applications")
+        } else {
+            NotchWarning.show(title: "\(unkeepable.count) icons cannot be kept",
+                              detail: "macOS needs them in /Applications")
+        }
     }
 
     /// Check that the collapse kept what it said it would keep.
