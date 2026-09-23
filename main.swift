@@ -155,6 +155,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var buriedChevronMonitor: Any?
     /// Instrument state for `watchTheChevronPosition`. Main thread only.
     var chevronWatchTimer: Timer?
+    /// The allow-list the live restriction was applied with, and the chevron
+    /// position it was worked out from. A collapse answers "which side of the
+    /// chevron is this icon on" once; these two are what make it possible to
+    /// notice that the answer has since changed. Main thread only.
+    private var appliedKeep: Set<String> = []
+    private var appliedChevronX: CGFloat?
+    /// The allow-list the last re-apply replaced, kept only to notice the set
+    /// flipping back and forth instead of settling. See
+    /// `reconsiderTheRestriction`.
+    private var replacedKeep: Set<String>?
+    /// Re-checks the collapse decision while the bar stays collapsed.
+    private var restrictionWatchTimer: Timer?
+    /// The previous tick's reading, so a move is only acted on once it has
+    /// stopped. See `watchForTheBarMovingUnderTheRestriction`.
+    private var lastSeenChevronX: CGFloat?
     /// Kept so the chevron watcher can follow `logChevronMoves` being written
     /// while the app runs. See `updateChevronWatcher()`.
     var defaultsObserver: NSObjectProtocol?
@@ -648,11 +663,168 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
+        appliedKeep = Set(keep)
+        appliedChevronX = chevron.x
+        replacedKeep = nil
+        watchForTheBarMovingUnderTheRestriction()
+
         logTheBarAsItWasRead(inventory, chevron: chevron, keep: keep)
         let unkeepable = allowListedAppsMacOSCannotKeep(keep)
         logAllowListedAppsInUnusualLocations(unkeepable)
         warnIfAnAppCannotBeKept(unkeepable)
         verifyTheCollapseKeptWhatItPromised(keep, before: inventory)
+    }
+
+    /// How often the collapse decision is re-checked while the bar stays
+    /// collapsed. The same cadence as the chevron instrument, and for the same
+    /// reason: it is the shortest poll that is still free, because reading one
+    /// item's position costs a single Accessibility call.
+    private static let restrictionWatchInterval: TimeInterval = 1.0
+
+    /// Notice when the bar moves under a restriction that has already been
+    /// applied, and re-decide.
+    ///
+    /// ## The fault this fixes
+    ///
+    /// A collapse answers one question — is this icon left or right of the
+    /// chevron's midpoint — and that answer is then **frozen** into the holder
+    /// process's allow-list. Nothing revisited it. But the bar keeps moving
+    /// while collapsed, and this app's own icon moves with it.
+    ///
+    /// Measured 2026-09-23 on Jonathan's machine. A collapse at 14:42:21 put
+    /// the chevron at 1701, so RainbowApple's item at 1790-1814 was right of it
+    /// and was allow-listed, correctly. The chevron then moved to 1962 at
+    /// 14:44:43 and to **2056** at 14:51:48, while still collapsed. RainbowApple
+    /// had not moved, so it was now 260 points *left* of the chevron and should
+    /// have been hidden — but the frozen allow-list still permitted it, and it
+    /// sat there stranded on the wrong side of the chevron for the next 40
+    /// minutes. The next collapse, with the chevron already at 2056, logged
+    /// `HIDE 1790-1814 cc.jorviksoftware.RainbowApple`: same rule, same app,
+    /// opposite verdict, and the only difference was the chevron position.
+    ///
+    /// ## Why a re-apply rather than a better first decision
+    ///
+    /// The first decision cannot be made any better. It reads a cached
+    /// snapshot because a full Accessibility sweep takes 0.6-0.8 s on this
+    /// estate and was measured at 29.3 s in the worst case, and putting that on
+    /// the click path was tried and rejected for making the collapse feel slow.
+    /// So the snapshot is routinely stale — ages from 0.1 s to 22.6 s in one
+    /// day's log — and 12 of 133 collapses that day acted on a bar that had
+    /// already changed. **None of the 36 collapses whose snapshot was under
+    /// 3 s old stranded anything; all 12 came from the 97 that were older.**
+    ///
+    /// Re-deciding a second later off the click path fixes both faults with one
+    /// mechanism: the fresh walk sees the icons the stale snapshot missed, and
+    /// the fresh chevron position sees the ones that changed sides.
+    private func watchForTheBarMovingUnderTheRestriction() {
+        guard restrictionWatchTimer == nil else { return }
+        let pid = ProcessInfo.processInfo.processIdentifier
+        restrictionWatchTimer = Timer.scheduledTimer(
+            withTimeInterval: AppDelegate.restrictionWatchInterval, repeats: true) { [weak self] _ in
+            // Off the main thread: asking Accessibility about our own process
+            // needs our own main thread free to answer it.
+            DispatchQueue.global(qos: .utility).async {
+                guard let x = MenuBarInventory.liveLeftmostItemX(ofProcessIdentifier: pid) else { return }
+                DispatchQueue.main.async {
+                    guard let self, self.isCollapsed, MenuBarRestriction.isRestricting else { return }
+                    let previous = self.lastSeenChevronX
+                    self.lastSeenChevronX = x
+                    guard let applied = self.appliedChevronX, x != applied else { return }
+
+                    // Act on a move only once it has stopped. macOS reflows the
+                    // bar in bursts — the log has the chevron moving five times
+                    // in ten seconds while Ballast's title changed — and each
+                    // reconsideration costs a full Accessibility sweep, 0.6-0.8 s
+                    // here and measured at 29.3 s in the worst case. Reacting to
+                    // every intermediate position would walk the bar
+                    // continuously for as long as the burst lasted. Two equal
+                    // readings a second apart is the cheapest possible "it has
+                    // settled", and it needs no delay constant to tune.
+                    guard previous == x else { return }
+                    self.reconsiderTheRestriction(chevronMovedTo: x, from: applied)
+                }
+            }
+        }
+    }
+
+    private func stopWatchingForTheBarMovingUnderTheRestriction() {
+        restrictionWatchTimer?.invalidate()
+        restrictionWatchTimer = nil
+        appliedKeep = []
+        appliedChevronX = nil
+        replacedKeep = nil
+        lastSeenChevronX = nil
+    }
+
+    /// Re-run the collapse decision against the bar as it is now, and re-apply
+    /// only if the answer is different.
+    ///
+    /// The comparison is on the **allow-list**, never on the chevron position.
+    /// The chevron drifts by a point or two constantly, and re-applying on
+    /// every drift would spawn a holder process a second for no visible change.
+    /// A move is only the trigger to look; the set is what decides.
+    ///
+    /// `restrict(toVisible:)` is safe to call again: it starts the new holder
+    /// before terminating the old one, so the bar never flashes back to its
+    /// unrestricted state in between.
+    private func reconsiderTheRestriction(chevronMovedTo x: CGFloat, from applied: CGFloat) {
+        // A full sweep, not a fast one. The fast set is exactly what loses an
+        // app when it quits and relaunches — a Sparkle update does precisely
+        // that — and the log names the casualties: ShortcutHUD, BrowserCommander,
+        // ScreenLock, WindowPin, each recovered only by a full sweep.
+        let requestedAt = Date()
+        MenuBarInventory.refresh(scope: .full) { [weak self] in
+            DispatchQueue.main.async {
+                guard let self, self.isCollapsed, MenuBarRestriction.isRestricting else { return }
+
+                // `refresh` runs one walk at a time and calls back immediately
+                // if another was already in flight, handing us the same stale
+                // snapshot we are trying to get past. Acting on that would
+                // compute the old answer, find it unchanged, and clear the
+                // trigger — leaving a genuinely stranded icon in place until
+                // the chevron happened to move again. So require a snapshot
+                // taken at or after the moment we asked, and otherwise leave
+                // `appliedChevronX` alone so the next tick tries again.
+                guard let age = MenuBarInventory.snapshotAge,
+                      Date().addingTimeInterval(-age) >= requestedAt else { return }
+
+                guard let chevron = self.chevronRect() else { return }
+                var keep = MenuBarInventory.bundleIdentifiers(leftOf: chevron)
+                if let ownIdentifier = Bundle.main.bundleIdentifier, !keep.contains(ownIdentifier) {
+                    keep.append(ownIdentifier)
+                }
+                let wanted = Set(keep)
+                // Store the LIVE reading that triggered this, not the snapshot's
+                // copy of it. The watcher compares against a live value every
+                // tick, and seeding it from a different call would leave the two
+                // a point apart and re-trigger a full walk every second.
+                self.appliedChevronX = x
+                guard wanted != self.appliedKeep else { return }
+
+                // Settling is the normal outcome, so a set that comes back to
+                // one we have already replaced is not settling — it is the bar
+                // and this app disagreeing. Stop, and say so, rather than
+                // trading holder processes about it indefinitely.
+                if let replaced = self.replacedKeep, wanted == replaced {
+                    MTDebug.log("restriction watch: allow-list is oscillating, leaving it alone until the next expand")
+                    self.stopWatchingForTheBarMovingUnderTheRestriction()
+                    return
+                }
+
+                let gained = wanted.subtracting(self.appliedKeep).sorted()
+                let lost = self.appliedKeep.subtracting(wanted).sorted()
+                MTDebug.log(String(format: "restriction watch: chevron moved %.0f -> %.0f, allow-list changed", applied, chevron.x))
+                if !lost.isEmpty { MTDebug.log("  now hiding: \(lost.joined(separator: ", "))") }
+                if !gained.isEmpty { MTDebug.log("  now keeping: \(gained.joined(separator: ", "))") }
+
+                guard MenuBarRestriction.restrict(toVisible: keep) else {
+                    MTDebug.log("restriction watch: re-apply failed, leaving the existing restriction in place")
+                    return
+                }
+                self.replacedKeep = self.appliedKeep
+                self.appliedKeep = wanted
+            }
+        }
     }
 
     /// How often the chevron watcher reads this app's own icon position.
@@ -982,6 +1154,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // arrangement) would collapse, revert, and collapse again on a loop.
     func expand(startTracking: Bool = true) {
         isCollapsed = false
+        stopWatchingForTheBarMovingUnderTheRestriction()
         if MenuBarRestriction.isAvailable {
             MenuBarRestriction.release()
             // Re-inventory now the bar is whole again. A restricted bar
