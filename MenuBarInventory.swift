@@ -437,6 +437,35 @@ enum MenuBarInventory {
         return AXUIElementPerformAction(clock.element, kAXPressAction as CFString) == .success
     }
 
+    /// Pairs of items reporting the same rectangle, within `tolerance` points.
+    ///
+    /// **Two real items never overlap**, so a collision means macOS has dropped
+    /// something and left its rectangle behind. That is the overfull-bar
+    /// artefact, and it is a far better signal of it than either trigger
+    /// `warnIfTheBarIsTooFull` had: measured 2026-09-23 on a bar carrying 24
+    /// items, the summed width came to **61%** of the screen, below the 80%
+    /// threshold, and macOS had not added its own overflow chevron either, yet
+    /// **11 pairs sat within 2 points of each other** and two pairs were exactly
+    /// identical. Neither existing trigger fired while the bar was visibly over
+    /// capacity.
+    ///
+    /// The width sum cannot see this by design — it deliberately sums widths
+    /// rather than measuring the span, because a hidden item is reported at the
+    /// position it would have had. Collisions are what that choice gives up,
+    /// and this puts it back.
+    static func collidingPairs(tolerance: CGFloat = 2) -> [(Item, Item)] {
+        let items = snapshot
+        var pairs: [(Item, Item)] = []
+        for (i, a) in items.enumerated() {
+            for b in items[(i + 1)...] {
+                if abs(a.x - b.x) <= tolerance && abs(a.maxX - b.maxX) <= tolerance {
+                    pairs.append((a, b))
+                }
+            }
+        }
+        return pairs
+    }
+
     /// The bundle identifiers of every app that must stay visible when the bar
     /// collapses to a chevron occupying `chevron`.
     ///

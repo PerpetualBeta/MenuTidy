@@ -1495,9 +1495,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Off the main thread: asking whether macOS has added its own chevron
         // means a round trip to another process, and this runs after every
         // expand.
+        // A third trigger, and the only one that fired on the bar that prompted
+        // it. Two real items never overlap, so items reporting the same
+        // rectangle mean macOS has dropped something and kept its place.
+        let collisions = MenuBarInventory.collidingPairs()
+
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let alreadyHiding = MenuBarInventory.macOSIsHidingItems
-            guard alreadyHiding || share >= threshold else { return }
+            guard alreadyHiding || share >= threshold || !collisions.isEmpty else { return }
             DispatchQueue.main.async {
                 guard let self, !self.hasSaidTheBarIsFull else { return }
                 self.hasSaidTheBarIsFull = true
@@ -1505,7 +1510,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     "menu bar is %.0f%% full (%.0f pt of %.0f pt), threshold %.0f%%; macOS %@ hiding items of its own accord",
                     share * 100, share * width, width, threshold * 100,
                     alreadyHiding ? "IS" : "is not"))
-                if alreadyHiding {
+                for (a, b) in collisions {
+                    MTDebug.log(String(format: "  colliding: %@ and %@ both at %.0f-%.0f",
+                                       a.bundleIdentifier, b.bundleIdentifier, a.x, a.maxX))
+                }
+                if !collisions.isEmpty && !alreadyHiding && share < threshold {
+                    // The case both older triggers miss, and the reason this
+                    // one exists. Say what is actually observable rather than
+                    // quoting a percentage that looks fine.
+                    NotchWarning.show(title: "Menu bar is full",
+                                      detail: "macOS is stacking icons")
+                } else if alreadyHiding {
                     // Present tense on purpose. This is not a forecast: icons
                     // are being dropped right now.
                     NotchWarning.show(title: "Menu bar is full",
