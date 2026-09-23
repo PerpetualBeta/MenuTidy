@@ -170,6 +170,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// The previous tick's reading, so a move is only acted on once it has
     /// stopped. See `watchForTheBarMovingUnderTheRestriction`.
     private var lastSeenChevronX: CGFloat?
+    /// An allow-list worked out once and waiting to be seen a second time
+    /// before it is applied. See `reconsiderTheRestriction`.
+    private var pendingKeep: Set<String>?
+    /// Observes screen changes only while collapsed. See
+    /// `watchForTheBarMovingUnderTheRestriction`.
+    private var screenChangeObserver: NSObjectProtocol?
     /// Kept so the chevron watcher can follow `logChevronMoves` being written
     /// while the app runs. See `updateChevronWatcher()`.
     var defaultsObserver: NSObjectProtocol?
@@ -718,6 +724,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// the fresh chevron position sees the ones that changed sides.
     private func watchForTheBarMovingUnderTheRestriction() {
         guard restrictionWatchTimer == nil else { return }
+
+        // A display being plugged or unplugged is the one event that moves
+        // every item in the bar at once, and it is the case that beat the
+        // settle check: the chevron stopped moving while the rest of the bar
+        // was still reporting its old positions. Throwing away a half-formed
+        // answer here means at least two readings taken *after* the change
+        // have to agree before anything is applied.
+        //
+        // This only listens. It rebuilds nothing, so it cannot re-post the
+        // notification it is handling.
+        screenChangeObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil, queue: .main) { [weak self] _ in
+            guard let self, self.pendingKeep != nil || self.lastSeenChevronX != nil else { return }
+            MTDebug.log("restriction watch: screens changed, discarding the reading in hand")
+            self.pendingKeep = nil
+            self.lastSeenChevronX = nil
+        }
+
         let pid = ProcessInfo.processInfo.processIdentifier
         restrictionWatchTimer = Timer.scheduledTimer(
             withTimeInterval: AppDelegate.restrictionWatchInterval, repeats: true) { [weak self] _ in
@@ -729,6 +754,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     guard let self, self.isCollapsed, MenuBarRestriction.isRestricting else { return }
                     let previous = self.lastSeenChevronX
                     self.lastSeenChevronX = x
+                    // A pending answer must be re-checked whether or not the
+                    // chevron moves again. After a display change it settles
+                    // immediately and then never moves, so waiting for another
+                    // move would leave the pending answer unconfirmed for ever.
+                    if self.pendingKeep != nil {
+                        self.reconsiderTheRestriction(chevronMovedTo: x, from: self.appliedChevronX ?? x)
+                        return
+                    }
                     guard let applied = self.appliedChevronX, x != applied else { return }
 
                     // Act on a move only once it has stopped. macOS reflows the
@@ -750,10 +783,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func stopWatchingForTheBarMovingUnderTheRestriction() {
         restrictionWatchTimer?.invalidate()
         restrictionWatchTimer = nil
+        if let screenChangeObserver {
+            NotificationCenter.default.removeObserver(screenChangeObserver)
+            self.screenChangeObserver = nil
+        }
         appliedKeep = []
         appliedChevronX = nil
         replacedKeep = nil
         lastSeenChevronX = nil
+        pendingKeep = nil
     }
 
     /// Re-run the collapse decision against the bar as it is now, and re-apply
@@ -799,7 +837,29 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 // tick, and seeding it from a different call would leave the two
                 // a point apart and re-trigger a full walk every second.
                 self.appliedChevronX = x
-                guard wanted != self.appliedKeep else { return }
+                guard wanted != self.appliedKeep else { self.pendingKeep = nil; return }
+
+                // Require the SAME answer twice, a second apart, before acting.
+                //
+                // The earlier guard asked whether the chevron had stopped
+                // moving, and that is not the same question as whether the bar
+                // has settled. Measured 2026-09-23 when an external display was
+                // unplugged: the chevron went 2056 -> 3568 -> 1008 in half a
+                // second, 3568 being off the end of a 1512-point display, and
+                // two seconds later it read 1008 twice running while every
+                // other item still reported its 2560-wide position. All of them
+                // were greater than 1008, so all of them counted as right of
+                // the chevron, and the re-apply un-hid ten icons that were
+                // correctly hidden. The bar stayed that way, because nothing
+                // moved again to trigger another look.
+                //
+                // A mid-reflow reading does not repeat; a settled one does.
+                guard self.pendingKeep == wanted else {
+                    self.pendingKeep = wanted
+                    MTDebug.log("restriction watch: allow-list would change, waiting for a second reading to agree")
+                    return
+                }
+                self.pendingKeep = nil
 
                 // Settling is the normal outcome, so a set that comes back to
                 // one we have already replaced is not settling — it is the bar
