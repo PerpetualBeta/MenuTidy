@@ -155,16 +155,17 @@ macOS 27 drops menu bar icons of its own accord once the bar runs out of room, a
 
 A dropped icon also **keeps its rectangle**. It stops being drawn, but the space it occupied stays claimed, so part of the menu bar becomes a dead region where clicks reach nothing at all. If that region lands on MenuTidy's chevron, the chevron stops responding and looks broken. It is not broken; there is simply nothing there to click.
 
-None of that is something MenuTidy can fix, and all of it looks exactly like MenuTidy misbehaving. So from 2.3.0 it tells you. A small panel drops from the notch, once per run, when either:
+None of that is something MenuTidy can fix, and all of it looks exactly like MenuTidy misbehaving. So from 2.3.0 it tells you. A small panel drops from the notch, once per run, when any of:
 
 - macOS has added **its own** chevron to the menu bar, which it does only while it is actually hiding icons, or
+- two or more icons are stacked on the same spot, which is macOS having dropped one and kept its place, or
 - your status icons need 80% or more of the screen's width.
 
-The first is the signal worth trusting, because it is a fact rather than a forecast. On the Mac this was developed on it fired at 67% full while macOS was already dropping icons — the percentage on its own would have said nothing.
+The first two are the signals worth trusting, because they are facts rather than forecasts. On the Mac this was developed on the chevron fired at 67% full while macOS was already dropping icons, and the stacking check caught a bar measuring only 61% with six apps sharing one 36-point slot. The percentage on its own would have said nothing in either case.
 
 The remedy is to put less in the menu bar: quit an app you are not using, or remove a system icon in Control Centre settings.
 
-The width threshold is adjustable. The other trigger is not: if macOS is actively hiding your icons, that is worth knowing about.
+The width threshold is adjustable. The other two are not: if macOS is actively hiding or stacking your icons, that is worth knowing about.
 
 ```
 defaults write cc.jorviksoftware.MenuTidy menuBarFullThreshold -float 0.9
