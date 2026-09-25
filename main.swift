@@ -193,7 +193,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// menu dismissal expanded the bar, and since a recovery deliberately does
     /// not re-arm auto-collapse, it switched auto-collapse off as well.
     private var menuIsOpen = false
-    /// Said once per run. See `warnIfTheBarIsTooFull(countCollisions:)`.
+    /// Said once per run. See `warnIfTheBarIsTooFull(context:)`.
     private var hasSaidTheBarIsFull = false
     /// Said once per run. See `warnIfAnAppCannotBeKept(_:)`.
     private var hasSaidAnAppCannotBeKept = false
@@ -272,7 +272,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // First inventory for the macOS 27 collapse path, in the background.
         // Deliberately outside the notch gate above: the hidden-icons cache is
         // only useful on a notched display, but collapsing is not.
-        MenuBarInventory.refresh { [weak self] in self?.warnIfTheBarIsTooFull(countCollisions: false) }
+        MenuBarInventory.refresh { [weak self] in self?.warnIfTheBarIsTooFull(context: "launch") }
         // Take an inventory whenever the permission arrives, so granting it never
         // requires a restart. The watcher handles the announcement and the stale
         // read that follows it; this only reacts to the settled answer.
@@ -1107,7 +1107,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     ///
     /// ## Said once per run
     ///
-    /// Exactly as `warnIfTheBarIsTooFull(countCollisions:)` is, and for the same reason: this
+    /// Exactly as `warnIfTheBarIsTooFull(context:)` is, and for the same reason: this
     /// is something to learn once, not to be nagged about on every collapse.
     ///
     /// ## The wording is short because the pill cannot wrap
@@ -1240,7 +1240,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // Re-inventory now the bar is whole again. A restricted bar
             // under-reports, so a snapshot taken during a collapse would shrink
             // the allow-list a little more each cycle.
-            MenuBarInventory.refresh { [weak self] in self?.warnIfTheBarIsTooFull(countCollisions: true) }
+            MenuBarInventory.refresh { [weak self] in self?.warnIfTheBarIsTooFull(context: "expand") }
         } else {
             spacerItem?.length = 0
         }
@@ -1506,87 +1506,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     ///
     /// This is something to learn, not something to be nagged about. Once the
     /// user knows, repeating it every time they expand the bar adds nothing.
-    /// Check the bar, counting collisions only when `countCollisions` is set.
+    /// Check the bar after a launch or an expand, and warn if it is too full.
     ///
-    /// ## Collisions are not counted at launch
+    /// ## Stacked icons are not a signal
     ///
-    /// Every collision warning in the log fired within two seconds of a
-    /// previous run releasing its restriction, and every "colliding" pair was
-    /// icons that run had just been hiding. Measured 2026-09-25: the bar at
-    /// 40%, macOS hiding nothing, and "Menu bar is full" shown because
-    /// BrowserNotes, ShortcutHUD and Browser Commander all reported 1958-1996
-    /// and CopyLens and Rainy Day both 1863-1901. A hidden icon's frame is
-    /// parked beside this app's own icon, not where it is, so at launch a
-    /// collision is the previous run's restriction, not a full bar. The width
-    /// and macOS-is-hiding checks still run, and they are what caught the real
-    /// full bars in the same log.
+    /// 2.3.0 to 2.3.10 also warned when two icons reported the same rectangle,
+    /// on the theory that macOS had dropped one and kept its place. Measured
+    /// 2026-09-25, that is not what a shared rectangle means. BrowserNotes,
+    /// ShortcutHUD and Browser Commander reported 1958-1996 all day: at
+    /// launch, after every expand, and still 1.6 s after a release on a
+    /// settled bar at 41% with macOS hiding nothing. Every stacking warning in
+    /// the log was false, or fired alongside the macOS-is-hiding check anyway.
+    /// An icon macOS is not drawing, for whatever reason, keeps a parked
+    /// frame, and nothing here can tell that apart from a dropped one. So the
+    /// warning rests on the two checks that caught every real full bar.
     ///
-    /// After an expand, a collision counts only if a second reading
-    /// `collisionConfirmDelay` later shows the same pair. A parked frame is a
-    /// reading taken mid-reflow, and a mid-reflow reading does not repeat.
-    /// Whether one delay is long enough is not known yet; the probe below
-    /// logs both readings on every launch and expand so that it can be
-    /// measured rather than guessed.
-    private func warnIfTheBarIsTooFull(countCollisions: Bool) {
-        let context = countCollisions ? "expand" : "launch"
-        let first = MenuBarInventory.collidingPairs()
-        logCollisionProbe(first, reading: "first", context: context)
-
-        guard countCollisions, !first.isEmpty else {
-            decideWhetherTheBarIsTooFull(collisions: [])
-            return
-        }
-        let recheckAt = Date().addingTimeInterval(Self.collisionConfirmDelay)
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.collisionConfirmDelay) { [weak self] in
-            MenuBarInventory.refresh {
-                guard let self else { return }
-                // `refresh` hands back the old snapshot when a walk is already
-                // in flight, and comparing a reading with itself would confirm
-                // every pair. Count nothing rather than that.
-                guard let age = MenuBarInventory.snapshotAge,
-                      Date().addingTimeInterval(-age) >= recheckAt else {
-                    MTDebug.log("collision probe (\(context)): second reading was stale, counting no collisions")
-                    self.decideWhetherTheBarIsTooFull(collisions: [])
-                    return
-                }
-                let second = MenuBarInventory.collidingPairs()
-                let seen = Set(second.map(Self.collisionKey))
-                let confirmed = first.filter { seen.contains(Self.collisionKey($0)) }
-                self.logCollisionProbe(second, reading: "second", context: context)
-                MTDebug.log("collision probe (\(context)): \(confirmed.count) of \(first.count) pair(s) still there")
-                self.decideWhetherTheBarIsTooFull(collisions: confirmed)
-            }
-        }
-    }
-
-    /// How long after the first reading the second is taken. One tick of the
-    /// chevron watcher, the interval the restriction watch already trusts to
-    /// separate a settled reading from a mid-reflow one.
-    private static let collisionConfirmDelay = chevronWatchInterval
-
-    /// When the bar was last released by an expand in this run, for the probe.
-    private var lastReleasedAt: Date?
-
-    /// A pair's identity across two readings: who collided, and where.
-    private static func collisionKey(_ pair: (MenuBarInventory.Item, MenuBarInventory.Item)) -> String {
-        let ids = [pair.0.bundleIdentifier, pair.1.bundleIdentifier].sorted()
-        return "\(ids[0])|\(ids[1])|\(Int(pair.0.x.rounded()))"
-    }
-
-    /// Log every collision reading, warning or not. An instrument, so it only
-    /// writes when debug logging is on, and it is not gated on having warned.
-    private func logCollisionProbe(_ pairs: [(MenuBarInventory.Item, MenuBarInventory.Item)],
-                                   reading: String, context: String) {
-        let when = lastReleasedAt.map { String(format: "%.1fs after release", Date().timeIntervalSince($0)) }
-            ?? "no release this run"
-        MTDebug.log("collision probe (\(context), \(reading) reading, \(when)): \(pairs.count) pair(s)")
-        for (a, b) in pairs {
-            MTDebug.log(String(format: "    %@ and %@ at %.0f-%.0f",
-                               a.bundleIdentifier, b.bundleIdentifier, a.x, a.maxX))
-        }
-    }
-
-    private func decideWhetherTheBarIsTooFull(collisions: [(MenuBarInventory.Item, MenuBarInventory.Item)]) {
+    /// The collision probe stays, as logging only, in case a real stacking
+    /// case ever turns up: `grep "collision probe"` in the debug log.
+    private func warnIfTheBarIsTooFull(context: String) {
+        logCollisionProbe(MenuBarInventory.collidingPairs(), context: context)
         guard !hasSaidTheBarIsFull,
               let width = NSScreen.main?.frame.width,
               let share = MenuBarInventory.occupancy(ofScreenWidth: width) else { return }
@@ -1597,7 +1535,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // expand.
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let alreadyHiding = MenuBarInventory.macOSIsHidingItems
-            guard alreadyHiding || share >= threshold || !collisions.isEmpty else { return }
+            guard alreadyHiding || share >= threshold else { return }
             DispatchQueue.main.async {
                 guard let self, !self.hasSaidTheBarIsFull else { return }
                 self.hasSaidTheBarIsFull = true
@@ -1605,17 +1543,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     "menu bar is %.0f%% full (%.0f pt of %.0f pt), threshold %.0f%%; macOS %@ hiding items of its own accord",
                     share * 100, share * width, width, threshold * 100,
                     alreadyHiding ? "IS" : "is not"))
-                for (a, b) in collisions {
-                    MTDebug.log(String(format: "  colliding: %@ and %@ both at %.0f-%.0f",
-                                       a.bundleIdentifier, b.bundleIdentifier, a.x, a.maxX))
-                }
-                if !collisions.isEmpty && !alreadyHiding && share < threshold {
-                    // The case both older triggers miss, and the reason this
-                    // one exists. Say what is actually observable rather than
-                    // quoting a percentage that looks fine.
-                    NotchWarning.show(title: "Menu bar is full",
-                                      detail: "macOS is stacking icons")
-                } else if alreadyHiding {
+                if alreadyHiding {
                     // Present tense on purpose. This is not a forecast: icons
                     // are being dropped right now.
                     NotchWarning.show(title: "Menu bar is full",
@@ -1625,6 +1553,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                       detail: "macOS may start hiding icons")
                 }
             }
+        }
+    }
+
+    /// When the bar was last released by an expand in this run, for the probe.
+    private var lastReleasedAt: Date?
+
+    /// Log icons that share a rectangle. An instrument only: it decides
+    /// nothing, and writes only when debug logging is on.
+    private func logCollisionProbe(_ pairs: [(MenuBarInventory.Item, MenuBarInventory.Item)],
+                                   context: String) {
+        let when = lastReleasedAt.map { String(format: "%.1fs after release", Date().timeIntervalSince($0)) }
+            ?? "no release this run"
+        MTDebug.log("collision probe (\(context), \(when)): \(pairs.count) pair(s)")
+        for (a, b) in pairs {
+            MTDebug.log(String(format: "    %@ and %@ at %.0f-%.0f",
+                               a.bundleIdentifier, b.bundleIdentifier, a.x, a.maxX))
         }
     }
 

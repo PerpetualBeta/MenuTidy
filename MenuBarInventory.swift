@@ -439,20 +439,17 @@ enum MenuBarInventory {
 
     /// Pairs of items reporting the same rectangle, within `tolerance` points.
     ///
-    /// **Two real items never overlap**, so a collision means macOS has dropped
-    /// something and left its rectangle behind. That is the overfull-bar
-    /// artefact, and it is a far better signal of it than either trigger
-    /// `warnIfTheBarIsTooFull` had: measured 2026-09-23 on a bar carrying 24
-    /// items, the summed width came to **61%** of the screen, below the 80%
-    /// threshold, and macOS had not added its own overflow chevron either, yet
-    /// **11 pairs sat within 2 points of each other** and two pairs were exactly
-    /// identical. Neither existing trigger fired while the bar was visibly over
-    /// capacity.
+    /// Used only by the collision probe, which logs and decides nothing.
     ///
-    /// The width sum cannot see this by design — it deliberately sums widths
-    /// rather than measuring the span, because a hidden item is reported at the
-    /// position it would have had. Collisions are what that choice gives up,
-    /// and this puts it back.
+    /// This was a "menu bar is full" trigger from 2.3.0, on the theory that
+    /// two real items never overlap, so a shared rectangle meant macOS had
+    /// dropped one. **Measured 2026-09-25, it does not mean that.** An item
+    /// macOS is not drawing keeps a parked frame, whatever the reason:
+    /// BrowserNotes, ShortcutHUD and Browser Commander reported 1958-1996 all
+    /// day on a settled bar at 41% with macOS hiding nothing. The 2026-09-23
+    /// reading that motivated the trigger (61%, eleven pairs) was taken at a
+    /// launch, just after a restriction was released, so it showed parked
+    /// frames rather than a full bar. The trigger was removed in 2.3.11.
     static func collidingPairs(tolerance: CGFloat = 2) -> [(Item, Item)] {
         let items = snapshot
         var pairs: [(Item, Item)] = []
