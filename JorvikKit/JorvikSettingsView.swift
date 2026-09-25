@@ -25,15 +25,18 @@ struct JorvikSettingsView<AppSettings: View>: View {
             // twice, one line under the other. The title bar is where macOS
             // puts it, so that is the copy that stays.
             //
-            // The heading was also carrying the pane's top inset, so the Form
-            // takes that on below.
+            // The heading was also carrying the pane's top inset. Form needs
+            // that back, or the first section sits flush against the title bar.
             Form {
                 // App-specific settings first (if any)
                 appSettings()
 
                 if showsLaunchAtLogin {
-                    Section("General") {
-                        Toggle("Launch at Login", isOn: $launchAtLogin)
+                    Section(L10n.string("settings.general", defaultValue: "General")) {
+                        Toggle(
+                            L10n.string("settings.launch_at_login", defaultValue: "Launch at Login"),
+                            isOn: $launchAtLogin
+                        )
                             .onChange(of: launchAtLogin) { _, newValue in
                                 do {
                                     if newValue {
@@ -55,7 +58,7 @@ struct JorvikSettingsView<AppSettings: View>: View {
 
             HStack {
                 Spacer()
-                Button("Done") {
+                Button(L10n.string("settings.done", defaultValue: "Done")) {
                     NSApp.keyWindow?.close()
                 }
                 .keyboardShortcut(.cancelAction)
@@ -128,7 +131,7 @@ struct JorvikSettingsView<AppSettings: View>: View {
         let size = JorvikSettingsMetrics.contentSize(fitting: fittingSize, on: screen, style: style)
 
         let window = NSWindow(contentViewController: controller)
-        window.title = "\(appName) Settings"
+        window.title = L10n.format("settings.title_format", defaultValue: "%@ Settings", appName)
         window.styleMask = style
         window.isReleasedWhenClosed = false
         window.setContentSize(size)

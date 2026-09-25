@@ -147,8 +147,11 @@ struct MenuBarPillSettings: View {
     var onChanged: (() -> Void)?
 
     var body: some View {
-        Section("Menu Bar Icon") {
-            Toggle("Show background pill", isOn: $enabled)
+        Section(L10n.string("settings.menu_bar_icon", defaultValue: "Menu Bar Icon")) {
+            Toggle(
+                L10n.string("settings.show_background_pill", defaultValue: "Show background pill"),
+                isOn: $enabled
+            )
                 .onChange(of: enabled) { _, newValue in
                     UserDefaults.standard.set(newValue, forKey: "menuBarPillEnabled")
                     onChanged?()

@@ -45,7 +45,11 @@ enum JorvikMenuBuilder {
         let menu = NSMenu()
 
         // About
-        let aboutItem = NSMenuItem(title: "About \(appName)", action: aboutAction, keyEquivalent: "")
+        let aboutItem = NSMenuItem(
+            title: L10n.format("menu.about_format", defaultValue: "About %@", appName),
+            action: aboutAction,
+            keyEquivalent: ""
+        )
         aboutItem.target = target
         menu.addItem(aboutItem)
 
@@ -73,13 +77,21 @@ enum JorvikMenuBuilder {
 
         // Settings
         menu.addItem(.separator())
-        let settingsItem = NSMenuItem(title: "Settings\u{2026}", action: settingsAction, keyEquivalent: ",")
+        let settingsItem = NSMenuItem(
+            title: L10n.string("menu.settings", defaultValue: "Settings\u{2026}"),
+            action: settingsAction,
+            keyEquivalent: ","
+        )
         settingsItem.target = target
         menu.addItem(settingsItem)
 
         // Quit
         menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Quit \(appName)", action: #selector(NSApp.terminate(_:)), keyEquivalent: "q"))
+        menu.addItem(NSMenuItem(
+            title: L10n.format("menu.quit_format", defaultValue: "Quit %@", appName),
+            action: #selector(NSApp.terminate(_:)),
+            keyEquivalent: "q"
+        ))
 
         return menu
     }
