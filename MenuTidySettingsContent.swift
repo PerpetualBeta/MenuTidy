@@ -96,30 +96,31 @@ struct MenuTidyAutoCollapseSettings: View {
                     onChanged?()
                 }
 
-            HStack {
-                Text("Collapse after")
-                Spacer()
-                TextField("", value: $seconds, format: .number)
-                    .labelsHidden()
-                    .frame(width: 54)
-                    .multilineTextAlignment(.trailing)
-                Stepper("", value: $seconds, in: 0...Self.maxSeconds)
-                    .labelsHidden()
-                Text(seconds == 1 ? "second" : "seconds")
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("Collapse after")
+                    Spacer()
+                    TextField("", value: $seconds, format: .number)
+                        .labelsHidden()
+                        .frame(width: 54)
+                        .multilineTextAlignment(.trailing)
+                    Stepper("", value: $seconds, in: 0...Self.maxSeconds)
+                        .labelsHidden()
+                    Text(seconds == 1 ? "second" : "seconds")
+                        .foregroundStyle(.secondary)
+                }
+                .disabled(!enabled)
+                .onChange(of: seconds) { _, newValue in
+                    // TextField can produce out-of-range values; the Stepper can't.
+                    let clamped = min(Self.maxSeconds, max(0, newValue))
+                    if clamped != newValue { seconds = clamped; return }  // re-fires with clamped
+                    UserDefaults.standard.set(clamped, forKey: "autoCollapseDelay")
+                    onChanged?()
+                }
+                Text("Tidies the menu bar this many seconds after the pointer leaves it. Set to 0 to collapse the moment you move away.")
+                    .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            .disabled(!enabled)
-            .onChange(of: seconds) { _, newValue in
-                // TextField can produce out-of-range values; the Stepper can't.
-                let clamped = min(Self.maxSeconds, max(0, newValue))
-                if clamped != newValue { seconds = clamped; return }  // re-fires with clamped
-                UserDefaults.standard.set(clamped, forKey: "autoCollapseDelay")
-                onChanged?()
-            }
-
-            Text("Tidies the menu bar this many seconds after the pointer leaves it. Set to 0 to collapse the moment you move away.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
         }
     }
 }
