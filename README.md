@@ -158,10 +158,10 @@ A dropped icon also **keeps its rectangle**. It stops being drawn, but the space
 None of that is something MenuTidy can fix, and all of it looks exactly like MenuTidy misbehaving. So from 2.3.0 it tells you. A small panel drops from the notch, once per run, when any of:
 
 - macOS has added **its own** chevron to the menu bar, which it does only while it is actually hiding icons, or
-- two or more icons are stacked on the same spot, which is macOS having dropped one and kept its place, or
+- two or more icons are stacked on the same spot after you expand the bar, and are still stacked a second later, which is macOS having dropped one and kept its place, or
 - your status icons need 80% or more of the screen's width.
 
-The first two are the signals worth trusting, because they are facts rather than forecasts. On the Mac this was developed on the chevron fired at 67% full while macOS was already dropping icons, and the stacking check caught a bar measuring only 61% with six apps sharing one 36-point slot. The percentage on its own would have said nothing in either case.
+The first is the signal worth trusting, because it is a fact rather than a forecast: on the Mac this was developed on, it fired at 67% full while macOS was already dropping icons, when the percentage on its own would have said nothing. Stacking needs more care. Icons MenuTidy has just been hiding report a shared spot for a moment after the bar is released, so MenuTidy never counts stacking when it starts up, and after an expand it counts only icons that are still stacked a second later.
 
 The remedy is to put less in the menu bar: quit an app you are not using, or remove a system icon in Control Centre settings.
 
