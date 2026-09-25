@@ -831,6 +831,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if let ownIdentifier = Bundle.main.bundleIdentifier, !keep.contains(ownIdentifier) {
                     keep.append(ownIdentifier)
                 }
+                // Hide-only while collapsed: never un-hide an icon this
+                // restriction is already hiding.
+                //
+                // A hidden icon's frame is not where it is. macOS parks it
+                // beside this app's own icon. Measured 2026-09-25: Browser
+                // Commander, BrowserNotes, ShortcutHUD and Save Cannes all
+                // reported 1958-1996 at once, which four drawn icons cannot
+                // do. When the chevron moved left (1983 -> 1962) those parked
+                // frames fell right of its midpoint, the re-apply "kept" all
+                // four plus RememberMyWindows, and RememberMyWindows was drawn
+                // left of the chevron for five minutes until the next move.
+                //
+                // Nothing is lost by refusing. Items keep their order, so an
+                // icon left of this one stays left of it however far the
+                // chevron moves; the only real way back is an expand, which
+                // releases everything anyway. The same guard covers the
+                // display-unplug case described below, where stale positions
+                // un-hid ten icons at once.
+                keep = keep.filter { self.appliedKeep.contains($0) }
                 let wanted = Set(keep)
                 // Store the LIVE reading that triggered this, not the snapshot's
                 // copy of it. The watcher compares against a live value every
