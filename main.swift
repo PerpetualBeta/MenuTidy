@@ -551,6 +551,29 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// moves the very icon the user is reaching for out from under the cursor.
     private var revealPanelOpen: Bool { revealPanel?.isVisible == true }
 
+    /// True while any app has a menu on screen: a menu-bar icon's menu, or a
+    /// context menu.
+    ///
+    /// Collapsing then hides the icon whose menu is open, and on macOS 27 the
+    /// bar keeps that icon marked as open after the menu goes. Its next clicks
+    /// do nothing, through any number of collapses and expands, until another
+    /// icon is clicked. Reproduced with Rectangle: the collapse fired with its
+    /// menu open, and after Escape and a fresh expand two clicks on it opened
+    /// nothing; one click on Lookout, and Rectangle opened again.
+    ///
+    /// Menus are windows at exactly the pop-up menu level, 101. Measured: none
+    /// with no menu open, one with Rectangle's. Exactly, not "at or above",
+    /// because Displaperture's corners sit at 999 and are always on screen.
+    /// Measured: 72 ms for the first query in a process, then a median of
+    /// 0.37 ms. It is still made only when a collapse is about to fire, never
+    /// per mouse move.
+    private var aMenuIsOpen: Bool {
+        let level = Int(CGWindowLevelForKey(.popUpMenuWindow))
+        let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
+                                                 kCGNullWindowID) as? [[String: Any]] ?? []
+        return windows.contains { ($0[kCGWindowLayer as String] as? Int) == level }
+    }
+
     /// Arm the collapse countdown while the pointer is outside the vicinity;
     /// cancel it the moment it returns. Armed only once on leaving (guarded by
     /// `autoCollapsePending == nil`) so continued movement outside the band
@@ -576,6 +599,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 // panel may have opened, since the countdown was armed.
                 guard self.autoCollapseEnabled, !self.isCollapsed,
                       !self.pointerInMenuBar(), !self.revealPanelOpen else { return }
+                // A menu still open is not hidden under the user. With a delay
+                // it waits one more delay: the pointer is still away from the
+                // bar, so this re-arms the countdown. With a delay of 0 it does
+                // not re-arm, which would spin for as long as the menu stayed
+                // open; the next pointer move tries again, which is how a 0
+                // delay starts its countdown anyway.
+                if self.aMenuIsOpen {
+                    if self.autoCollapseDelay > 0 {
+                        MTDebug.log("auto-collapse: a menu is open — waiting another \(self.autoCollapseDelay)s")
+                        self.evaluateAutoCollapse()
+                    } else {
+                        MTDebug.log("auto-collapse: a menu is open — trying again on the next pointer move")
+                    }
+                    return
+                }
                 MTDebug.log("auto-collapse: firing collapse")
                 self.collapse(userInitiated: false)
             }

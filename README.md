@@ -226,6 +226,8 @@ By default the bar stays in whatever state you left it — expand to peek at you
 
 The countdown starts when the pointer leaves the menu bar and is cancelled if you move back up to it before it elapses — so the bar only tidies once you've genuinely moved away.
 
+It also waits while a menu is open. Opening an icon's menu moves the pointer down into the menu, so without this the bar could collapse and hide the icon whose menu you are using. On macOS 27 that left the icon ignoring clicks until another icon was clicked.
+
 ## Building from Source
 
 MenuTidy is a single-file Swift app with no dependencies beyond macOS system frameworks. No Xcode project is required.
