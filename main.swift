@@ -173,6 +173,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// An allow-list worked out once and waiting to be seen a second time
     /// before it is applied. See `reconsiderTheRestriction`.
     private var pendingKeep: Set<String>?
+    /// When the restriction in force was worked out from a reading that put two icons in the
+    /// same place, so it may be keeping an icon it should hide. Nil when the reading made
+    /// sense. See `MenuBarInventory.impossibleOverlaps`. Main thread only.
+    private var readingInDoubtSince: Date?
+    /// Set when the watch has waited `readingInDoubtLimit` for a reading that makes sense and
+    /// not had one. Until the next expand it stops waiting, and it still never acts on an
+    /// impossible reading. Without this, the next chevron move started the wait again: the
+    /// first test build gave up at 11:10:46 and was waiting again at 11:10:47.
+    private var readingDoubtAbandoned = false
     /// Observes screen changes only while collapsed. See
     /// `watchForTheBarMovingUnderTheRestriction`.
     private var screenChangeObserver: NSObjectProtocol?
@@ -712,6 +721,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         replacedKeep = nil
         watchForTheBarMovingUnderTheRestriction()
 
+        // The click cannot wait for a better reading (see `restrictionWatchInterval`), so the
+        // collapse goes ahead on this one. But a reading with two icons in one place is known to
+        // be stale, so the watch re-reads until one makes sense rather than waiting for the
+        // chevron to move. Hide-only applies, so the correction can only hide an icon this
+        // reading wrongly kept.
+        let overlaps = MenuBarInventory.impossibleOverlaps(in: inventory, rightOf: chevron.x + chevron.width / 2)
+        if !overlaps.isEmpty {
+            readingInDoubtSince = Date()
+            MTDebug.log("collapse: the reading puts \(Self.describe(overlaps)) in the same place; re-reading while collapsed")
+            // Now, not at the next watch tick: the wrongly kept icons are on screen until this
+            // finishes. Waiting for the tick added up to a second of that in the first test build.
+            reconsiderTheRestriction(chevronMovedTo: chevron.x, from: chevron.x)
+        }
+
         logTheBarAsItWasRead(inventory, chevron: chevron, keep: keep)
         let unkeepable = allowListedAppsMacOSCannotKeep(keep)
         logAllowListedAppsInUnusualLocations(unkeepable)
@@ -724,6 +747,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// reason: it is the shortest poll that is still free, because reading one
     /// item's position costs a single Accessibility call.
     private static let restrictionWatchInterval: TimeInterval = 1.0
+
+    /// How long the watch keeps re-reading a bar whose readings put two icons in one place.
+    ///
+    /// Each re-read is a full sweep, 0.4 s here, so this bounds the cost of a reading that never
+    /// settles. Measured 2026-10-09: stale overlaps came back in collapses 8, 11 and 24 seconds
+    /// apart, so they can outlast one re-read but have not been seen to outlast half a minute.
+    /// Sixty seconds is more than twice the longest seen, and the log says when it runs out.
+    private static let readingInDoubtLimit: TimeInterval = 60
+
+    /// How soon to ask again when a re-read finds another walk already in flight. A full walk
+    /// takes 0.3 to 0.5 s here, so asking every tenth of a second catches its end within 0.1 s
+    /// without stacking walks: `refresh` never starts a second while one is running.
+    private static let walkInFlightRetry: TimeInterval = 0.1
+
+    /// "Ballast and RainyDay, Ballast and Rectangle", for the log.
+    private static func describe(_ overlaps: [(MenuBarInventory.Item, MenuBarInventory.Item)]) -> String {
+        overlaps.map { "\($0.0.appName) and \($0.1.appName)" }.joined(separator: ", ")
+    }
 
     /// Notice when the bar moves under a restriction that has already been
     /// applied, and re-decide.
@@ -800,6 +841,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         self.reconsiderTheRestriction(chevronMovedTo: x, from: self.appliedChevronX ?? x)
                         return
                     }
+                    // The same for a restriction worked out from a reading that cannot be true.
+                    // On 2026-10-09 the chevron did not move for 75 seconds after such a
+                    // collapse, so Rainy Day and Rectangle stayed visible for all of them.
+                    if self.readingInDoubtSince != nil {
+                        self.reconsiderTheRestriction(chevronMovedTo: x, from: self.appliedChevronX ?? x)
+                        return
+                    }
                     guard let applied = self.appliedChevronX, x != applied else { return }
 
                     // Act on a move only once it has stopped. macOS reflows the
@@ -830,6 +878,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         replacedKeep = nil
         lastSeenChevronX = nil
         pendingKeep = nil
+        readingInDoubtSince = nil
+        readingDoubtAbandoned = false
     }
 
     /// Re-run the collapse decision against the bar as it is now, and re-apply
@@ -862,9 +912,63 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 // taken at or after the moment we asked, and otherwise leave
                 // `appliedChevronX` alone so the next tick tries again.
                 guard let age = MenuBarInventory.snapshotAge,
-                      Date().addingTimeInterval(-age) >= requestedAt else { return }
+                      Date().addingTimeInterval(-age) >= requestedAt else {
+                    // While a reading is in doubt, wrongly kept icons are on screen, so do not wait
+                    // a whole tick for the walk in flight to finish: ask again shortly after it.
+                    // Measured 2026-10-09 11:37:54: a click 1.6 s after an expand arrived while
+                    // the settled reading was still walking, and waiting for the tick added a
+                    // second before the four kept icons were hidden.
+                    if self.readingInDoubtSince != nil || self.pendingKeep != nil {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + AppDelegate.walkInFlightRetry) { [weak self] in
+                            self?.reconsiderTheRestriction(chevronMovedTo: x, from: applied)
+                        }
+                    }
+                    return
+                }
 
                 guard let chevron = self.chevronRect() else { return }
+
+                // Never act on a reading that cannot be true: it is the stale input that caused
+                // the wrong decision in the first place. Wait for one that makes sense, and give
+                // up after `readingInDoubtLimit` so a reading that never settles cannot keep the
+                // bar walked every second.
+                //
+                // Only the icons this restriction keeps are drawn, so only theirs can be judged.
+                // A hidden icon reports a parked frame beside this app's own icon (see the
+                // hide-only note below), and the first test build counted those: at 11:09:45 on
+                // 2026-10-09 the hidden RememberMyWindows and Rectangle "overlapped" MenuTidy and
+                // Ballast, and the watch re-read the bar every second for nothing. A wrongly kept
+                // icon is still caught, because being kept is exactly what is wrong with it.
+                let drawn = MenuBarInventory.snapshot.filter { self.appliedKeep.contains($0.bundleIdentifier) }
+                let overlaps = MenuBarInventory.impossibleOverlaps(
+                    in: drawn, rightOf: chevron.x + chevron.width / 2)
+                let resolvingDoubt = self.readingInDoubtSince != nil
+                if let since = self.readingInDoubtSince {
+                    let waited = Date().timeIntervalSince(since)
+                    if !overlaps.isEmpty {
+                        guard waited < AppDelegate.readingInDoubtLimit else {
+                            MTDebug.log(String(format: "restriction watch: readings still put %@ in the same place after %.0fs; giving up until the next expand",
+                                               Self.describe(overlaps), waited))
+                            self.readingInDoubtSince = nil
+                            self.readingDoubtAbandoned = true
+                            self.pendingKeep = nil
+                            return
+                        }
+                        self.pendingKeep = nil
+                        return
+                    }
+                    MTDebug.log(String(format: "restriction watch: the reading makes sense again after %.1fs", waited))
+                    self.readingInDoubtSince = nil
+                } else if !overlaps.isEmpty {
+                    // Given up already: do not start waiting again, and do not act on it either.
+                    guard !self.readingDoubtAbandoned else { self.pendingKeep = nil; return }
+                    // A move led here, but this reading is stale too. Stay put and look again.
+                    MTDebug.log("restriction watch: the reading puts \(Self.describe(overlaps)) in the same place; waiting for one that makes sense")
+                    self.readingInDoubtSince = Date()
+                    self.pendingKeep = nil
+                    return
+                }
+
                 var keep = MenuBarInventory.bundleIdentifiers(leftOf: chevron)
                 if let ownIdentifier = Bundle.main.bundleIdentifier, !keep.contains(ownIdentifier) {
                     keep.append(ownIdentifier)
@@ -914,6 +1018,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 guard self.pendingKeep == wanted else {
                     self.pendingKeep = wanted
                     MTDebug.log("restriction watch: allow-list would change, waiting for a second reading to agree")
+                    // After a reading in doubt, the wrongly kept icons are on screen, so take the
+                    // second reading at once rather than at the next tick. Back to back is still
+                    // two separate full sweeps, so the agreement check keeps its meaning.
+                    if resolvingDoubt {
+                        self.reconsiderTheRestriction(chevronMovedTo: x, from: applied)
+                    }
                     return
                 }
                 self.pendingKeep = nil
@@ -1278,13 +1388,42 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // Re-inventory now the bar is whole again. A restricted bar
             // under-reports, so a snapshot taken during a collapse would shrink
             // the allow-list a little more each cycle.
-            MenuBarInventory.refresh { [weak self] in self?.warnIfTheBarIsTooFull(context: "expand") }
+            MenuBarInventory.refresh { [weak self] in
+                self?.warnIfTheBarIsTooFull(context: "expand")
+                self?.takeASettledReading(releasedAt: Date())
+            }
         } else {
             spacerItem?.length = 0
         }
         updateIcon()
         if startTracking {
             startAutoCollapseTracking()
+        }
+    }
+
+    /// Read the bar again once it has settled after an expand, so the next collapse decides from
+    /// positions that are true.
+    ///
+    /// The reading taken the moment the icons are released is often stale: the icons that were
+    /// hidden still report where they were parked, and an icon beside a text item like Ballast
+    /// reports where it was before the text changed width. Measured 2026-10-09: four collapses in
+    /// fifteen minutes, two of them auto-collapses and two clicks, decided from that reading
+    /// (1.3 to 5.4 s old) and kept icons it put inside Ballast. In all four, a reading taken
+    /// 1.4 s after the collapse made sense. One more reading, one watch tick after the first,
+    /// means a collapse at any later moment decides from the settled bar.
+    private func takeASettledReading(releasedAt: Date) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + AppDelegate.restrictionWatchInterval) { [weak self] in
+            guard let self, !self.isCollapsed else { return }
+            MenuBarInventory.refresh(scope: .full) { [weak self] in
+                DispatchQueue.main.async {
+                    guard let self, !self.isCollapsed, let chevron = self.chevronRect() else { return }
+                    let overlaps = MenuBarInventory.impossibleOverlaps(
+                        in: MenuBarInventory.snapshot, rightOf: chevron.x + chevron.width / 2)
+                    MTDebug.log(String(format: "expand: settled reading %.1fs after release%@",
+                                       Date().timeIntervalSince(releasedAt),
+                                       overlaps.isEmpty ? " makes sense" : " still puts \(Self.describe(overlaps)) in the same place"))
+                }
+            }
         }
     }
 

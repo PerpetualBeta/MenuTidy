@@ -493,6 +493,30 @@ enum MenuBarInventory {
     /// neighbouring items in a packed bar overlap by a point or two. Measuring
     /// to the left edge would keep whatever sits immediately left of the chevron
     /// every time, which would hide almost nothing.
+    /// How far two neighbouring items overlap in an honest reading. Measured over 304 collapses
+    /// on 2026-10-09: kept neighbours shared 1 point 280 times and 2 points 1,546 times, and
+    /// more than 2 only 120 times, almost all of them the stale readings described below.
+    static let neighbourOverlap: CGFloat = 2
+
+    /// Pairs of items that a reading puts in the same place on the kept side of the chevron.
+    ///
+    /// Two drawn icons cannot overlap, so a pair like this means at least one position in the
+    /// reading is stale. Measured 2026-10-09: 30 of 304 collapses kept such a pair, and 28 of
+    /// them involved Ballast, whose song title changes width. When it does, the icons beside it
+    /// keep reporting where they were: at 10:53:19 Ballast read 1821-2075 while Rainy Day read
+    /// 1968 and Rectangle 2034, inside it. Both were really drawn LEFT of the chevron, so both
+    /// were kept and stayed visible on the collapsed bar for 75 seconds.
+    static func impossibleOverlaps(in items: [Item], rightOf divider: CGFloat) -> [(Item, Item)] {
+        let kept = items.filter { $0.maxX > divider }.sorted { $0.x < $1.x }
+        var pairs: [(Item, Item)] = []
+        for (i, a) in kept.enumerated() {
+            for b in kept[(i + 1)...] where min(a.maxX, b.maxX) - max(a.x, b.x) > neighbourOverlap {
+                pairs.append((a, b))
+            }
+        }
+        return pairs
+    }
+
     static func bundleIdentifiers(leftOf chevron: (x: CGFloat, width: CGFloat)) -> [String] {
         let divider = chevron.x + chevron.width / 2
         var keep = Set<String>()
