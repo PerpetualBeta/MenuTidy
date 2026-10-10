@@ -1874,7 +1874,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         JorvikAboutView.showWindow(
             appName: "MenuTidy",
             repoName: "MenuTidy",
-            productPage: "utilities/menutidy"
+            productPage: "utilities/menutidy",
+            credits: [
+                JorvikCredit(
+                    name: "Håvard Pedersen",
+                    contribution: L10n.string(
+                        "credits.havard",
+                        defaultValue: "suggested auto-collapse, and reported the faults that got MenuTidy working on macOS 26 and 27"
+                    ),
+                    url: URL(string: "https://github.com/fuzzy76")
+                ),
+                JorvikCredit(
+                    name: "Brian Liu",
+                    contribution: L10n.string(
+                        "credits.brian",
+                        defaultValue: "reported collapsing failing when the built-in display is not the main one"
+                    ),
+                    url: URL(string: "https://github.com/BLiu1")
+                )
+            ]
         )
     }
 
