@@ -158,11 +158,20 @@ enum MenuBarInventory {
                 // missing from the last allow-list, which means the last
                 // collapse hid it whichever side of the chevron it was on.
                 // Silent until this line existed.
-                let names = hosts.subtracting(knownBefore)
+                //
+                // Named only when the host owns an item laid out in the bar, because only then
+                // was an icon at stake. A host can own an extras menu bar and show nothing:
+                // `org.openvpn.client.app` registers a status item it never draws, and was 2 of
+                // the 15 recoveries logged on 2026-09-22. Those are counted, not named.
+                let recovered = hosts.subtracting(knownBefore)
                     .compactMap { NSRunningApplication(processIdentifier: $0)?.bundleIdentifier }
-                if !names.isEmpty {
-                    MTDebug.log("inventory: full sweep recovered \(names.count) host(s) the fast set had lost: "
-                                + names.sorted().joined(separator: ", "))
+                let laidOut = Set(items.map(\.bundleIdentifier))
+                let atStake = recovered.filter { laidOut.contains($0) }.sorted()
+                if !atStake.isEmpty {
+                    let quiet = recovered.count - atStake.count
+                    MTDebug.log("inventory: full sweep recovered \(atStake.count) host(s) the fast set had lost: "
+                                + atStake.joined(separator: ", ")
+                                + (quiet > 0 ? " (and \(quiet) with no icon in the bar)" : ""))
                 }
             }
             stateLock.sync {
