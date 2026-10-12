@@ -246,6 +246,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     )
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Start Sparkle now. `sparkleUpdater` is lazy, and its only other use
+        // is the Check for Updates… menu item, so from 2026-05-04 until this
+        // line was added Sparkle never started on its own and MenuTidy never
+        // checked for updates unless asked: SULastCheckTime stayed put through
+        // a relaunch that every other Jorvik app checked within 20 seconds of.
+        _ = sparkleUpdater
+
         migrateLegacyPillColorKey()
 
         // Auto-collapse config — a first-class setting (Settings → Auto-Collapse),
