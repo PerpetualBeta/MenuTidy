@@ -429,21 +429,36 @@ enum MenuBarInventory {
         }
     }
 
-    /// Ask the clock to act on a press, as if it had been clicked.
+    /// Marks a click this app posts itself, so its own global monitor can
+    /// tell that click from the user's. Any value nothing else uses will do;
+    /// this is "MTCK" in ASCII, so it reads back as itself in a debugger.
+    static let syntheticClickTag: Int64 = 0x4D54_434B
+
+    /// Click the clock at `point`, as if the user had.
     ///
-    /// This is how Notification Centre is opened without posting a synthetic
-    /// mouse event. It is refused while a restriction is active — measured
-    /// 2026-09-20, the call returns success and nothing opens — so the caller
-    /// has to lift the restriction first.
+    /// `point` is in Quartz global coordinates (top-left origin), the same
+    /// space `CGEvent.location` reads. The caller passes where the user's own
+    /// click landed, so the pointer does not move.
     ///
-    /// The element is looked up here rather than passed in, so that the lookup
-    /// happens AFTER the restriction has gone. An element found while the bar
-    /// was still restricted describes an item macOS was not drawing.
-    @discardableResult
-    static func pressSystemClock() -> Bool {
-        guard let clock = systemClock() else { return false }
-        AXUIElementSetMessagingTimeout(clock.element, messagingTimeout)
-        return AXUIElementPerformAction(clock.element, kAXPressAction as CFString) == .success
+    /// ## Why a posted click and not an Accessibility press
+    ///
+    /// Up to macOS 27.0 `AXPress` on the clock opened Notification Centre and
+    /// it stayed open. On 27.2.1 it opens the panel and the panel closes itself
+    /// 280 to 350 ms later, measured 2026-11-12 over five presses, with no
+    /// restriction active at all and no other window or app change in that
+    /// time. `AXShowMenu`, the clock's only other action, opens nothing. A
+    /// posted click opened the panel in 114 ms and it stayed open.
+    ///
+    /// Posting is refused while a restriction is active, the same as a real
+    /// click, so the caller has to lift the restriction first.
+    static func clickSystemClock(at point: CGPoint) {
+        let source = CGEventSource(stateID: .hidSystemState)
+        for type in [CGEventType.leftMouseDown, .leftMouseUp] {
+            guard let event = CGEvent(mouseEventSource: source, mouseType: type,
+                                      mouseCursorPosition: point, mouseButton: .left) else { continue }
+            event.setIntegerValueField(.eventSourceUserData, value: syntheticClickTag)
+            event.post(tap: .cghidEventTap)
+        }
     }
 
     /// Pairs of items reporting the same rectangle, within `tolerance` points.

@@ -314,7 +314,9 @@ enum MenuBarRestriction {
     /// with no waiting period at all, and re-applying the restriction
     /// afterwards does **not** close the panel again.
     ///
-    /// So the restriction is dropped for the length of one press.
+    /// So the restriction is dropped for the length of one press. Since
+    /// macOS 27.2 the press is a posted click rather than `AXPress`; see
+    /// `MenuBarInventory.clickSystemClock(at:)` for why.
     ///
     /// ## What this costs
     ///
@@ -326,6 +328,10 @@ enum MenuBarRestriction {
     /// Waiting for a process to exit, and talking to another process over
     /// Accessibility, are both things that must not happen on the thread that
     /// draws the menu bar.
+    ///
+    /// `action` runs off the main thread with the bar unrestricted, and the
+    /// restriction comes back when it returns. An action whose effect lands
+    /// later, such as a posted click, has to wait for that effect itself.
     static func withRestrictionLifted(do action: @escaping () -> Void) {
         guard let process = holder, process.isRunning else { action(); return }
         let allowList = heldAllowList

@@ -1516,6 +1516,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         buriedChevronMonitor = NSEvent.addGlobalMonitorForEvents(
             matching: [.leftMouseUp, .rightMouseUp]
         ) { [weak self] event in
+            // The clock relay posts a click of its own. It must not be taken
+            // for the user's: relayed again, it would close the panel it had
+            // just opened.
+            if event.cgEvent?.getIntegerValueField(.eventSourceUserData)
+                == MenuBarInventory.syntheticClickTag { return }
             guard let self, self.pointerInMenuBar() else { return }
             // Read the menu state HERE, not in the completion below: the probe
             // takes a few hundred milliseconds and the menu will have closed by
@@ -1526,7 +1531,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // is always allow-listed, so a click can never be inside both it
             // and this app's chevron.
             if event.type == .leftMouseUp {
-                self.relayClockClickIfItWentNowhere(at: NSEvent.mouseLocation.x)
+                self.relayClockClickIfItWentNowhere(at: NSEvent.mouseLocation.x,
+                                                    point: event.cgEvent?.location)
             }
             self.checkWhetherClickMissedTheChevron(at: NSEvent.mouseLocation.x,
                                                    wasRightButton: event.type == .rightMouseUp,
@@ -1768,6 +1774,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         UserDefaults.standard.object(forKey: "relayClockClick") as? Bool ?? true
     }
 
+    /// The longest the bar stays unrestricted waiting for the panel after a
+    /// relayed click. Measured 2026-11-12: the panel appeared 114 ms after a
+    /// posted click, and 81 to 196 ms after an Accessibility press. 500 ms is
+    /// over twice the slowest of those, and still short enough that a click
+    /// that opens nothing costs only a brief flash of the hidden icons.
+    private static let clockPanelWait: TimeInterval = 0.5
+
+    /// How often the wait above checks for the panel. One window-list read
+    /// each time, so this is cheap.
+    private static let clockPanelPoll: TimeInterval = 0.02
+
     /// Finish a click on the clock that macOS refused to act on.
     ///
     /// While the bar is collapsed a restriction is active, and macOS will not
@@ -1788,8 +1805,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// buried-chevron recovery put an Accessibility walk on the click path and
     /// the collapse visibly lagged. Nothing here needs the main thread until
     /// there is something to do.
-    private func relayClockClickIfItWentNowhere(at x: CGFloat) {
-        guard relayClockClick, MenuBarRestriction.isRestricting else { return }
+    private func relayClockClickIfItWentNowhere(at x: CGFloat, point: CGPoint?) {
+        guard relayClockClick, MenuBarRestriction.isRestricting, let point else { return }
 
         // A click made while the panel is open is the user closing it, and the
         // raw click already does that on its own — the panel dismisses on any
@@ -1823,8 +1840,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     "clock: a left-click at %.0f landed in the clock (%.0f-%.0f), which macOS ignores while restricted. Lifting the restriction to open Notification Centre.",
                     x, clock.x, clock.x + clock.width))
                 MenuBarRestriction.withRestrictionLifted {
-                    if !MenuBarInventory.pressSystemClock() {
-                        MTDebug.log("clock: the press failed")
+                    let pressed = Date()
+                    MenuBarInventory.clickSystemClock(at: point)
+                    // The click is queued, not delivered. Put the restriction
+                    // back before macOS has handled it and the click is
+                    // ignored like the user's was. So wait for the panel,
+                    // and give up after a bounded time rather than leave the
+                    // bar unrestricted.
+                    while !MenuBarInventory.isNotificationCentreShowing,
+                          Date().timeIntervalSince(pressed) < Self.clockPanelWait {
+                        Thread.sleep(forTimeInterval: Self.clockPanelPoll)
+                    }
+                    let waited = Date().timeIntervalSince(pressed) * 1000
+                    if MenuBarInventory.isNotificationCentreShowing {
+                        MTDebug.log(String(format: "clock: the panel opened after %.0f ms", waited))
+                    } else {
+                        MTDebug.log(String(format: "clock: the panel did not open within %.0f ms", waited))
                     }
                 }
             }
